@@ -1,11 +1,13 @@
-from dotenv import load_dotenv
-load_dotenv()
-
+import os
 import asyncio
 import logging
 from datetime import datetime
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import aiosqlite
+from aiohttp import web
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -29,8 +31,6 @@ except ImportError:
 # =============================================================================
 # 1. КОНФИГУРАЦИЯ И ПЕРЕМЕННЫЕ
 # =============================================================================
-
-import os
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -83,8 +83,6 @@ search_tasks: dict[int, asyncio.Task] = {}
 ai_histories: dict[int, list] = {}
 
 # ID последнего открытого inline-сообщения настроек: {user_id: message_id}
-# Нужен, чтобы подчищать зависшее меню настроек, если пользователь ушёл
-# в другой раздел через reply-кнопки, не нажав "Назад".
 user_settings_msg: dict[int, int] = {}
 
 
@@ -130,8 +128,6 @@ async def init_db() -> None:
         )
         await db.commit()
 
-        # Проверка структуры users через PRAGMA table_info и добавление
-        # отсутствующих колонок, чтобы не ловить KeyError на старых БД.
         cursor = await db.execute("PRAGMA table_info(users)")
         existing_columns = {row[1] for row in await cursor.fetchall()}
 
@@ -707,8 +703,7 @@ async def cb_feedback(callback: CallbackQuery) -> None:
 # =============================================================================
 
 async def remove_stale_settings_menu(user_id: int) -> None:
-    """Удаляет зависшее inline-сообщение настроек, если пользователь ушёл
-    в другой раздел меню, не нажав кнопку "Назад"."""
+    """Удаляет зависшее inline-сообщение настроек."""
     old_msg_id = user_settings_msg.pop(user_id, None)
     if old_msg_id:
         try:
@@ -734,13 +729,11 @@ async def unified_text_handler(message: Message) -> None:
 
     status = user["status"]
 
-    # --- Кнопка завершения активного диалога (чат или AI) ---
     if text == MENU_STOP and status in ("chatting", "ai_chat"):
         await remove_stale_settings_menu(user_id)
         await end_chat(user_id)
         return
 
-    # --- Пользователь находится в обычном чате с собеседником ---
     if status == "chatting":
         partner_id = user["partner_id"]
         if not partner_id:
@@ -760,20 +753,15 @@ async def unified_text_handler(message: Message) -> None:
             logger.warning("Не удалось переслать сообщение: %s", exc)
         return
 
-    # --- Пользователь общается с AI-Репетитором ---
     if status == "ai_chat":
         reply = await get_ai_reply(user_id, user["my_level"], text)
         await message.answer(reply)
         return
 
-    # --- Пользователь ожидает собеседника ---
     if status == "searching":
         await message.answer("🔍 Идёт поиск собеседника, пожалуйста, подождите...")
         return
 
-    # --- Статус 'idle' — распознаём кнопки главного меню по подстроке ---
-    # Если открыт "хвост" от предыдущей сессии настроек (пользователь ушёл
-    # в другой раздел, не нажав "Назад") — подчищаем его, чтобы не копился мусор.
     await remove_stale_settings_menu(user_id)
 
     if "Найти собеседника" in text:
@@ -832,16 +820,39 @@ async def show_stats(message: Message, user: aiosqlite.Row) -> None:
 
 
 # =============================================================================
-# 9. ЗАПУСК БОТА
+# 9. МИКРО-СЕРВЕР ДЛЯ RENDER (Фоновый порт)
+# =============================================================================
+
+async def handle_ping(request):
+    return web.Response(text="Bot is running!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info("Веб-сервер запущен на порту %s", port)
+
+
+# =============================================================================
+# 10. ЗАПУСК БОТА
 # =============================================================================
 
 async def main() -> None:
     await init_db()
+    
+    # Запускаем фоновый сервер для порта Render
+    await start_web_server()
+    
     logger.info("Бот запускается...")
     try:
         await bot.send_message(ADMIN_ID, "✅ Бот успешно запущен.")
     except Exception:
-        logger.info("Не удалось отправить стартовое сообщение администратору (это нормально при первом запуске).")
+        logger.info("Не удалось отправить стартовое сообщение администратору.")
 
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
