@@ -1,13 +1,11 @@
-import os
+from dotenv import load_dotenv
+load_dotenv()
+
 import asyncio
 import logging
 from datetime import datetime
 
-from dotenv import load_dotenv
-load_dotenv()
-
 import aiosqlite
-from aiohttp import web
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -32,9 +30,27 @@ except ImportError:
 # 1. КОНФИГУРАЦИЯ И ПЕРЕМЕННЫЕ
 # =============================================================================
 
+import os
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "8916615782"))
+
+# UPDATE: убран хардкод дефолтного ADMIN_ID. Раньше при отсутствии
+# переменной в .env бот тихо запускался с чужим/тестовым ID — жалобы и
+# админ-уведомления в этом случае уходили бы не туда. Теперь при отсутствии
+# или некорректном значении ADMIN_ID бот падает при старте (fail-fast),
+# не успев начать поллинг с неверной конфигурацией.
+_admin_id_raw = os.getenv("ADMIN_ID")
+if not _admin_id_raw:
+    raise ValueError(
+        "ADMIN_ID не задан в .env — укажите числовой Telegram ID администратора."
+    )
+try:
+    ADMIN_ID = int(_admin_id_raw)
+except ValueError as exc:
+    raise ValueError(
+        f"ADMIN_ID должен быть числом, получено: {_admin_id_raw!r}"
+    ) from exc
 
 DB_PATH = "language_exchange.db"
 GROQ_MODEL = "openai/gpt-oss-120b"
@@ -83,6 +99,8 @@ search_tasks: dict[int, asyncio.Task] = {}
 ai_histories: dict[int, list] = {}
 
 # ID последнего открытого inline-сообщения настроек: {user_id: message_id}
+# Нужен, чтобы подчищать зависшее меню настроек, если пользователь ушёл
+# в другой раздел через reply-кнопки, не нажав "Назад".
 user_settings_msg: dict[int, int] = {}
 
 
@@ -128,6 +146,8 @@ async def init_db() -> None:
         )
         await db.commit()
 
+        # Проверка структуры users через PRAGMA table_info и добавление
+        # отсутствующих колонок, чтобы не ловить KeyError на старых БД.
         cursor = await db.execute("PRAGMA table_info(users)")
         existing_columns = {row[1] for row in await cursor.fetchall()}
 
@@ -143,6 +163,28 @@ async def init_db() -> None:
                 except aiosqlite.OperationalError as exc:
                     logger.warning("Не удалось добавить колонку %s: %s", column_name, exc)
         await db.commit()
+
+        # UPDATE: очистка "зомби-сессий" при рестарте бота.
+        # Фоновые задачи search_timeout_task и партнёрские связи 'chatting' /
+        # 'ai_chat' живут только в памяти процесса — после перезапуска они
+        # теряются, но статус в БД остаётся прежним, и пользователь застревает
+        # в несуществующем чате/поиске навсегда. Поэтому при каждом старте
+        # принудительно сбрасываем все "активные" статусы обратно в 'idle'.
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM users WHERE status IN ('searching', 'chatting', 'ai_chat')"
+        )
+        zombie_count = (await cursor.fetchone())[0]
+        if zombie_count:
+            await db.execute(
+                """
+                UPDATE users
+                SET status = 'idle', partner_id = NULL
+                WHERE status IN ('searching', 'chatting', 'ai_chat')
+                """
+            )
+            await db.commit()
+            logger.info("Сброшено зомби-сессий при старте: %s", zombie_count)
+
     logger.info("База данных инициализирована: %s", DB_PATH)
 
 
@@ -202,7 +244,13 @@ async def add_report(reporter_id: int, reported_id: int) -> int:
         return new_count
 
 
-async def find_partner(user_id: int, topic: str, partner_level: str) -> int | None:
+# UPDATE: find_partner теперь ищет двусторонний матч по уровням.
+# Раньше матч строился только по partner_level кандидата, из-за чего
+# пара могла сойтись, даже если кандидату не подходил уровень ищущего.
+# Теперь оба условия обязательны:
+#   - candidate.my_level      == искомый уровень собеседника (partner_level ищущего)
+#   - candidate.partner_level == собственный уровень ищущего (my_level ищущего)
+async def find_partner(user_id: int, topic: str, my_level: str, partner_level: str) -> int | None:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             """
@@ -211,10 +259,11 @@ async def find_partner(user_id: int, topic: str, partner_level: str) -> int | No
               AND is_banned = 0
               AND user_id != ?
               AND topic = ?
+              AND my_level = ?
               AND partner_level = ?
             LIMIT 1
             """,
-            (user_id, topic, partner_level),
+            (user_id, topic, partner_level, my_level),
         )
         row = await cursor.fetchone()
         return row[0] if row else None
@@ -287,13 +336,16 @@ def after_search_timeout_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+# UPDATE: лайк/дизлайк заменены на 5-звёздочную оценку.
+# callback_data теперь имеет вид fb_rate_{partner_id}_{score}, где score от 1 до 5.
 def feedback_keyboard(partner_id: int) -> InlineKeyboardMarkup:
+    star_buttons = [
+        InlineKeyboardButton(text=f"{score}⭐️", callback_data=f"fb_rate_{partner_id}_{score}")
+        for score in range(1, 6)
+    ]
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(text="👍 Отлично", callback_data=f"fb_like_{partner_id}"),
-                InlineKeyboardButton(text="👎 Плохо", callback_data=f"fb_dislike_{partner_id}"),
-            ],
+            star_buttons,
             [InlineKeyboardButton(text="🚨 Пожаловаться", callback_data=f"fb_report_{partner_id}")],
         ]
     )
@@ -343,7 +395,9 @@ async def start_search(user_id: int) -> None:
 
     await update_user(user_id, status="searching")
 
-    partner_id = await find_partner(user_id, user["topic"], user["partner_level"])
+    # UPDATE: передаём и my_level, и partner_level ищущего — find_partner
+    # теперь матчит по обоим условиям одновременно (двусторонний матч).
+    partner_id = await find_partner(user_id, user["topic"], user["my_level"], user["partner_level"])
 
     if partner_id:
         cancel_search_task(partner_id)
@@ -641,16 +695,26 @@ async def cb_search_again(callback: CallbackQuery) -> None:
     await start_search(callback.from_user.id)
 
 
+# UPDATE: разбор callback_data переписан под 5-звёздочную систему.
+# Форматы теперь:
+#   fb_rate_{partner_id}_{score}  — оценка от 1 до 5
+#   fb_report_{partner_id}        — жалоба
+# Парсим через rsplit с фиксированным числом частей, чтобы не полагаться
+# на отсутствие "_" внутри partner_id (id всегда числовой, но так надёжнее).
 @router.callback_query(F.data.startswith("fb_"))
 async def cb_feedback(callback: CallbackQuery) -> None:
     await callback.answer()
 
-    _, action, target_id_str = callback.data.split("_")
-    target_id = int(target_id_str)
+    parts = callback.data.split("_")
+    action = parts[1]
     rater_id = callback.from_user.id
 
-    if action == "like" or action == "dislike":
-        score = 5.0 if action == "like" else 1.0
+    if action == "rate":
+        # fb_rate_{partner_id}_{score} -> parts = ["fb", "rate", partner_id, score]
+        target_id = int(parts[2])
+        score = int(parts[3])
+        score = max(1, min(5, score))  # защита от некорректного значения в callback_data
+
         target_user = await get_user(target_id)
         if target_user:
             current_rating = target_user["rating"] or 5.0
@@ -659,13 +723,15 @@ async def cb_feedback(callback: CallbackQuery) -> None:
             new_rating = ((current_rating * current_count) + score) / new_count
             await update_user(target_id, rating=round(new_rating, 2), rating_count=new_count)
 
-        thanks_text = "✅ Спасибо за оценку!" if action == "like" else "✅ Спасибо, ваша оценка учтена."
         try:
-            await callback.message.edit_text(thanks_text, reply_markup=None)
+            await callback.message.edit_text(
+                f"✅ Спасибо за оценку! Вы поставили {score}⭐️", reply_markup=None
+            )
         except TelegramBadRequest:
             pass
 
     elif action == "report":
+        target_id = int(parts[2])
         new_count = await add_report(rater_id, target_id)
 
         try:
@@ -703,7 +769,8 @@ async def cb_feedback(callback: CallbackQuery) -> None:
 # =============================================================================
 
 async def remove_stale_settings_menu(user_id: int) -> None:
-    """Удаляет зависшее inline-сообщение настроек."""
+    """Удаляет зависшее inline-сообщение настроек, если пользователь ушёл
+    в другой раздел меню, не нажав кнопку "Назад"."""
     old_msg_id = user_settings_msg.pop(user_id, None)
     if old_msg_id:
         try:
@@ -729,11 +796,13 @@ async def unified_text_handler(message: Message) -> None:
 
     status = user["status"]
 
+    # --- Кнопка завершения активного диалога (чат или AI) ---
     if text == MENU_STOP and status in ("chatting", "ai_chat"):
         await remove_stale_settings_menu(user_id)
         await end_chat(user_id)
         return
 
+    # --- Пользователь находится в обычном чате с собеседником ---
     if status == "chatting":
         partner_id = user["partner_id"]
         if not partner_id:
@@ -753,15 +822,20 @@ async def unified_text_handler(message: Message) -> None:
             logger.warning("Не удалось переслать сообщение: %s", exc)
         return
 
+    # --- Пользователь общается с AI-Репетитором ---
     if status == "ai_chat":
         reply = await get_ai_reply(user_id, user["my_level"], text)
         await message.answer(reply)
         return
 
+    # --- Пользователь ожидает собеседника ---
     if status == "searching":
         await message.answer("🔍 Идёт поиск собеседника, пожалуйста, подождите...")
         return
 
+    # --- Статус 'idle' — распознаём кнопки главного меню по подстроке ---
+    # Если открыт "хвост" от предыдущей сессии настроек (пользователь ушёл
+    # в другой раздел, не нажав "Назад") — подчищаем его, чтобы не копился мусор.
     await remove_stale_settings_menu(user_id)
 
     if "Найти собеседника" in text:
@@ -820,39 +894,16 @@ async def show_stats(message: Message, user: aiosqlite.Row) -> None:
 
 
 # =============================================================================
-# 9. МИКРО-СЕРВЕР ДЛЯ RENDER (Фоновый порт)
-# =============================================================================
-
-async def handle_ping(request):
-    return web.Response(text="Bot is running!")
-
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get("/", handle_ping)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    
-    port = int(os.environ.get("PORT", 8080))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    logger.info("Веб-сервер запущен на порту %s", port)
-
-
-# =============================================================================
-# 10. ЗАПУСК БОТА
+# 9. ЗАПУСК БОТА
 # =============================================================================
 
 async def main() -> None:
     await init_db()
-    
-    # Запускаем фоновый сервер для порта Render
-    await start_web_server()
-    
     logger.info("Бот запускается...")
     try:
         await bot.send_message(ADMIN_ID, "✅ Бот успешно запущен.")
     except Exception:
-        logger.info("Не удалось отправить стартовое сообщение администратору.")
+        logger.info("Не удалось отправить стартовое сообщение администратору (это нормально при первом запуске).")
 
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
