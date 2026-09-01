@@ -2,6 +2,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import asyncio
+import csv
+import io
 import logging
 from datetime import datetime
 
@@ -21,6 +23,7 @@ from aiogram.types import (
     KeyboardButton,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    BufferedInputFile,
 )
 
 try:
@@ -783,6 +786,72 @@ async def _send_feedback_comments(
 
     for chunk in chunks:
         await message.answer(chunk)
+
+
+# UPDATE: экспорт всей таблицы feedback в CSV для админа. В отличие от
+# /feedback_stats (агрегаты + последние 10 комментариев в тексте сообщения),
+# эта команда отдаёт полный сырой дамп — включая записи с пустым
+# comment — в виде файла, чтобы можно было открыть в Excel/Sheets и
+# анализировать/фильтровать самостоятельно.
+@router.message(Command("download_feedback"))
+async def cmd_download_feedback(message: Message) -> None:
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT
+                feedback.id,
+                feedback.user_id,
+                users.username,
+                feedback.category,
+                feedback.rating,
+                feedback.comment,
+                feedback.created_at
+            FROM feedback
+            LEFT JOIN users ON users.user_id = feedback.user_id
+            ORDER BY feedback.id DESC
+            """
+        )
+        rows = await cursor.fetchall()
+
+    if not rows:
+        await message.answer("📭 Отзывов пока нет — экспортировать нечего.")
+        return
+
+    category_labels = dict(FEEDBACK_CATEGORIES)
+
+    # UTF-8 with BOM (utf-8-sig), чтобы Excel по умолчанию корректно
+    # определял кодировку и не ломал кириллицу.
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(
+        ["id", "user_id", "username", "category", "rating", "comment", "created_at"]
+    )
+    for row in rows:
+        writer.writerow(
+            [
+                row["id"],
+                row["user_id"],
+                row["username"] or "",
+                category_labels.get(row["category"], row["category"] or ""),
+                row["rating"] if row["rating"] is not None else "",
+                row["comment"] or "",
+                row["created_at"],
+            ]
+        )
+
+    csv_bytes = buffer.getvalue().encode("utf-8-sig")
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    document = BufferedInputFile(csv_bytes, filename=f"feedback_export_{timestamp}.csv")
+
+    await message.answer_document(
+        document=document,
+        caption=f"📥 Экспорт таблицы feedback — {len(rows)} записей.",
+    )
 
 
 @router.message(Command("ban"))
