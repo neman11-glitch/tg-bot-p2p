@@ -703,6 +703,87 @@ async def cmd_feedback_stats(message: Message) -> None:
 
     await message.answer("\n".join(lines))
 
+    # UPDATE: ниже сводки — последние 10 отзывов с непустым текстовым
+    # комментарием. Джойним users, чтобы показать username (если есть),
+    # без него падать не должны — у части пользователей username может
+    # отсутствовать.
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT
+                feedback.id,
+                feedback.user_id,
+                feedback.category,
+                feedback.rating,
+                feedback.comment,
+                feedback.created_at,
+                users.username
+            FROM feedback
+            LEFT JOIN users ON users.user_id = feedback.user_id
+            WHERE feedback.comment IS NOT NULL AND feedback.comment != ''
+            ORDER BY feedback.id DESC
+            LIMIT 10
+            """
+        )
+        comment_rows = await cursor.fetchall()
+
+    if not comment_rows:
+        await message.answer("💬 Текстовых комментариев пока нет.")
+        return
+
+    await _send_feedback_comments(message, comment_rows, category_labels)
+
+
+# UPDATE: константы и хелпер для безопасного вывода списка комментариев.
+# Telegram режет сообщения на уровне ~4096 символов — при большом
+# количестве/длине комментариев собранный текст может этот лимит
+# превысить, поэтому собираем сообщения "пачками" и обрезаем длинные
+# одиночные комментарии, чтобы один отзыв не мог сломать форматирование
+# всего блока.
+TELEGRAM_MESSAGE_LIMIT = 4096
+FEEDBACK_COMMENT_MAX_LEN = 500
+
+
+async def _send_feedback_comments(
+    message: Message,
+    comment_rows: list[aiosqlite.Row],
+    category_labels: dict[str, str],
+) -> None:
+    header = "💬 <b>Последние комментарии (до 10):</b>\n"
+    chunks: list[str] = []
+    current = header
+
+    for row in comment_rows:
+        username = row["username"]
+        user_ref = f"@{username}" if username else f"ID <code>{row['user_id']}</code>"
+        label = category_labels.get(row["category"], row["category"] or "—")
+        stars = "⭐" * max(0, min(5, row["rating"] or 0))
+
+        comment_text = row["comment"] or ""
+        if len(comment_text) > FEEDBACK_COMMENT_MAX_LEN:
+            comment_text = comment_text[:FEEDBACK_COMMENT_MAX_LEN].rstrip() + "…"
+
+        entry = (
+            f"\n👤 {user_ref} | {label}\n"
+            f"{stars} ({row['rating'] or 0}/5)\n"
+            f"📝 {comment_text}\n"
+            f"🕒 {row['created_at']}\n"
+        )
+
+        # Если добавление очередной записи превысит лимит Telegram —
+        # отправляем накопленный кусок и начинаем новый.
+        if len(current) + len(entry) > TELEGRAM_MESSAGE_LIMIT:
+            chunks.append(current)
+            current = ""
+        current += entry
+
+    if current:
+        chunks.append(current)
+
+    for chunk in chunks:
+        await message.answer(chunk)
+
 
 @router.message(Command("ban"))
 async def cmd_ban(message: Message) -> None:
