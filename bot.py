@@ -6,6 +6,7 @@ import logging
 from datetime import datetime
 
 import aiosqlite
+from aiohttp import web
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -1196,8 +1197,37 @@ async def show_stats(message: Message, user: aiosqlite.Row) -> None:
 # 9. ЗАПУСК БОТА
 # =============================================================================
 
+async def health_check(request: web.Request) -> web.Response:
+    return web.Response(text="OK", status=200)
+
+
+async def start_health_check() -> None:
+    """Поднимает лёгкий HTTP-сервер для health-check'а Render.
+
+    Render Web Service ожидает, что процесс забиндится на порт из
+    переменной окружения PORT и будет отвечать на HTTP-запросы — иначе
+    деплой падает с таймаутом. Сам бот работает через long-polling и
+    никакого HTTP не поднимает, поэтому здесь запускается отдельный
+    минимальный aiohttp-сервер параллельно с polling'ом (просто чтобы
+    Render видел открытый порт и получал 200 OK на "/" и "/health").
+    """
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    app.router.add_get("/health", health_check)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+    logger.info("Health-check сервер запущен на 0.0.0.0:%s", port)
+
+
 async def main() -> None:
     await init_db()
+    await start_health_check()
     logger.info("Бот запускается...")
     try:
         await bot.send_message(ADMIN_ID, "✅ Бот успешно запущен.")
