@@ -10,7 +10,9 @@ from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     Message,
     CallbackQuery,
@@ -92,6 +94,24 @@ TOPICS = [
     "🎵Музыка",
 ]
 
+# UPDATE: категории для системы обратной связи. Формат (code, label) —
+# code уходит в callback_data и в колонку feedback.category, label — это
+# то, что видит пользователь на кнопке и админ в /feedback_stats.
+FEEDBACK_CATEGORIES = [
+    ("usability", "⭐ Удобство"),
+    ("search", "🔍 Поиск собеседника"),
+    ("communication", "💬 Общение"),
+    ("bug", "🐛 Сообщить об ошибке"),
+    ("suggestion", "💡 Предложить улучшение"),
+]
+
+
+# UPDATE: FSM-состояния сценария "Обратная связь".
+class FeedbackStates(StatesGroup):
+    waiting_for_category = State()
+    waiting_for_rating = State()
+    waiting_for_comment = State()
+
 # Активные фоновые задачи ожидания собеседника: {user_id: asyncio.Task}
 search_tasks: dict[int, asyncio.Task] = {}
 
@@ -120,6 +140,10 @@ USERS_TABLE_SCHEMA = {
     "rating_count": "INTEGER DEFAULT 0",
     "reports_count": "INTEGER DEFAULT 0",
     "is_banned": "INTEGER DEFAULT 0",
+    # UPDATE: новая колонка для системы статистики. У существующих БД её
+    # нет — init_db() ниже находит недостающие колонки через
+    # PRAGMA table_info и добавляет их через ALTER TABLE автоматически.
+    "completed_chats": "INTEGER DEFAULT 0",
     "created_at": "TIMESTAMP",
 }
 
@@ -141,6 +165,19 @@ async def init_db() -> None:
                 reporter_id INTEGER,
                 reported_id INTEGER,
                 created_at TIMESTAMP
+            )
+            """
+        )
+        # UPDATE: таблица для системы обратной связи.
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                category TEXT,
+                rating INTEGER,
+                comment TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
@@ -225,6 +262,19 @@ async def update_user(user_id: int, **fields) -> None:
         await db.commit()
 
 
+# UPDATE: атомарный инкремент completed_chats через SQL (col = col + 1),
+# а не через update_user() — тот умеет только присваивать значения, а
+# read-then-write с округлением через Python дал бы гонку между двумя
+# участниками, завершающими сессию почти одновременно.
+async def increment_completed_chats(user_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET completed_chats = completed_chats + 1 WHERE user_id = ?",
+            (user_id,),
+        )
+        await db.commit()
+
+
 async def add_report(reporter_id: int, reported_id: int) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -242,6 +292,16 @@ async def add_report(reporter_id: int, reported_id: int) -> int:
         )
         await db.commit()
         return new_count
+
+
+# UPDATE: сохранение отзыва в таблицу feedback.
+async def save_feedback(user_id: int, category: str, rating: int, comment: str | None) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO feedback (user_id, category, rating, comment) VALUES (?, ?, ?, ?)",
+            (user_id, category, rating, comment),
+        )
+        await db.commit()
 
 
 # UPDATE: find_partner теперь ищет двусторонний матч по уровням.
@@ -278,6 +338,8 @@ MENU_PROFILE = "👤 Профиль"
 MENU_SETTINGS = "⚙️ Настройка собеседника"
 MENU_STATS = "📊 Статистика"
 MENU_STOP = "❌ Завершить диалог"
+# UPDATE: новая кнопка обратной связи.
+MENU_FEEDBACK = "📝 Обратная связь"
 
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
@@ -285,7 +347,8 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text=MENU_SEARCH)],
             [KeyboardButton(text=MENU_PROFILE), KeyboardButton(text=MENU_SETTINGS)],
-            [KeyboardButton(text=MENU_STATS)],
+            # UPDATE: MENU_FEEDBACK стоит рядом со Статистикой, как просили в ТЗ.
+            [KeyboardButton(text=MENU_STATS), KeyboardButton(text=MENU_FEEDBACK)],
         ],
         resize_keyboard=True,
     )
@@ -348,6 +411,35 @@ def feedback_keyboard(partner_id: int) -> InlineKeyboardMarkup:
             star_buttons,
             [InlineKeyboardButton(text="🚨 Пожаловаться", callback_data=f"fb_report_{partner_id}")],
         ]
+    )
+
+
+# UPDATE: клавиатуры сценария "📝 Обратная связь".
+# Важно: префикс callback_data здесь — "fbs_" (Feedback Survey), а не "fb_",
+# чтобы НЕ пересекаться с уже существующим fb_rate_/fb_report_ из
+# пост-чатового фидбека (тот обрабатывается отдельным хэндлером
+# `F.data.startswith("fb_")`). "fbs_...".startswith("fb_") == False,
+# так что оба обработчика гарантированно не конфликтуют.
+def feedback_category_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=label, callback_data=f"fbs_cat_{code}")]
+        for code, label in FEEDBACK_CATEGORIES
+    ]
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="fbs_cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def feedback_rating_keyboard() -> InlineKeyboardMarkup:
+    stars = [
+        InlineKeyboardButton(text=f"⭐ {score}", callback_data=f"fbs_rate_{score}")
+        for score in range(1, 6)
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[stars])
+
+
+def feedback_comment_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="⏭️ Пропустить", callback_data="fbs_skip")]]
     )
 
 
@@ -444,6 +536,13 @@ async def end_chat(user_id: int, notify_partner: bool = True) -> None:
 
     if was_chatting:
         await update_user(partner_id, status="idle", partner_id=None)
+
+        # UPDATE: засчитываем завершённый диалог обеим сторонам. К этой
+        # точке status уже гарантированно 'chatting' (ветка 'ai_chat' выше
+        # уже сделала return), так что AI-сессии сюда никогда не попадают.
+        await increment_completed_chats(user_id)
+        await increment_completed_chats(partner_id)
+
         await bot.send_message(
             user_id,
             "Диалог завершён. Оцените, пожалуйста, вашего собеседника:",
@@ -548,6 +647,59 @@ async def cmd_reports(message: Message) -> None:
             f"#{row['id']} | Жалобщик: <code>{row['reporter_id']}</code> "
             f"→ Нарушитель: <code>{row['reported_id']}</code> | {row['created_at']}"
         )
+    await message.answer("\n".join(lines))
+
+
+# UPDATE: сводка по обратной связи для админа.
+@router.message(Command("feedback_stats"))
+async def cmd_feedback_stats(message: Message) -> None:
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT COUNT(*), AVG(rating) FROM feedback")
+        total_count, avg_rating = await cursor.fetchone()
+
+        cursor = await db.execute(
+            """
+            SELECT category, COUNT(*), AVG(rating)
+            FROM feedback
+            GROUP BY category
+            ORDER BY COUNT(*) DESC
+            """
+        )
+        category_rows = await cursor.fetchall()
+
+    if not total_count:
+        await message.answer("📭 Отзывов пока нет.")
+        return
+
+    category_labels = dict(FEEDBACK_CATEGORIES)
+    global_rating = round(avg_rating, 2) if avg_rating is not None else 0.0
+
+    lines = [
+        "📊 <b>Статистика обратной связи</b>",
+        f"📝 Всего отзывов: <b>{total_count}</b>",
+        f"⭐ Средняя оценка: <b>{global_rating}</b>",
+        "",
+        "<b>По категориям:</b>",
+    ]
+
+    bug_count = 0
+    suggestion_count = 0
+    for category_code, count, cat_avg_rating in category_rows:
+        label = category_labels.get(category_code, category_code)
+        cat_avg = round(cat_avg_rating, 2) if cat_avg_rating is not None else 0.0
+        lines.append(f"{label}: <b>{count}</b> (ср. {cat_avg}⭐)")
+        if category_code == "bug":
+            bug_count = count
+        elif category_code == "suggestion":
+            suggestion_count = count
+
+    lines.append("")
+    lines.append(f"🐛 Сообщений об ошибках: <b>{bug_count}</b>")
+    lines.append(f"💡 Предложений по улучшению: <b>{suggestion_count}</b>")
+
     await message.answer("\n".join(lines))
 
 
@@ -764,6 +916,88 @@ async def cb_feedback(callback: CallbackQuery) -> None:
             pass
 
 
+# UPDATE: callback-хэндлеры сценария "📝 Обратная связь" (FSM).
+# Шаг 1: выбор категории. Точка входа переводит состояние в
+# waiting_for_category (см. unified_text_handler), эта функция — переход
+# к следующему шагу или отмена по "◀️ Назад".
+@router.callback_query(FeedbackStates.waiting_for_category, F.data.startswith("fbs_cat_"))
+async def cb_feedback_category(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+
+    code = callback.data.removeprefix("fbs_cat_")
+    label = dict(FEEDBACK_CATEGORIES).get(code, code)
+
+    await state.update_data(category_code=code, category_label=label)
+    await state.set_state(FeedbackStates.waiting_for_rating)
+
+    try:
+        await callback.message.edit_text(
+            f"Категория: <b>{label}</b>\n\nОцените от 1 до 5:",
+            reply_markup=feedback_rating_keyboard(),
+        )
+    except TelegramBadRequest:
+        pass
+
+
+@router.callback_query(F.data == "fbs_cancel")
+async def cb_feedback_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.clear()
+
+    try:
+        await callback.message.edit_text("Отменено.", reply_markup=None)
+    except TelegramBadRequest:
+        pass
+    await callback.message.answer("Главное меню:", reply_markup=main_menu_keyboard())
+
+
+# Шаг 2: выбор оценки 1-5.
+@router.callback_query(FeedbackStates.waiting_for_rating, F.data.startswith("fbs_rate_"))
+async def cb_feedback_rating(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+
+    score = int(callback.data.removeprefix("fbs_rate_"))
+    score = max(1, min(5, score))  # защита от некорректного значения в callback_data
+
+    await state.update_data(rating=score)
+    await state.set_state(FeedbackStates.waiting_for_comment)
+
+    try:
+        await callback.message.edit_text(
+            f"Оценка: {'⭐' * score}\n\n"
+            "Напишите короткий комментарий (необязательно) или нажмите «Пропустить»:",
+            reply_markup=feedback_comment_keyboard(),
+        )
+    except TelegramBadRequest:
+        pass
+
+
+# Шаг 3 (skip-ветка): пользователь нажал "Пропустить" вместо ввода текста.
+# Ветка с текстовым комментарием обрабатывается в unified_text_handler,
+# т.к. это обычное текстовое сообщение, а не callback.
+@router.callback_query(FeedbackStates.waiting_for_comment, F.data == "fbs_skip")
+async def cb_feedback_skip(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+
+    data = await state.get_data()
+    await save_feedback(
+        user_id=callback.from_user.id,
+        category=data.get("category_code", "unknown"),
+        rating=data.get("rating", 0),
+        comment=None,
+    )
+    await state.clear()
+
+    try:
+        await callback.message.edit_text(
+            "✅ Спасибо за feedback! Ваш отзыв сохранён и поможет улучшить Language Exchange Bot.",
+            reply_markup=None,
+        )
+    except TelegramBadRequest:
+        pass
+    await callback.message.answer("Главное меню:", reply_markup=main_menu_keyboard())
+
+
 # =============================================================================
 # 8. ЕДИНЫЙ ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ
 # =============================================================================
@@ -780,9 +1014,39 @@ async def remove_stale_settings_menu(user_id: int) -> None:
 
 
 @router.message(F.text)
-async def unified_text_handler(message: Message) -> None:
+async def unified_text_handler(message: Message, state: FSMContext) -> None:
     user_id = message.from_user.id
     text = message.text or ""
+
+    # UPDATE: перехват шага "комментарий" сценария обратной связи.
+    # Проверяем это ДО ensure_user/is_banned/status-веток, чтобы не зависеть
+    # от статуса пользователя в БД (во время фидбека он всегда 'idle') и не
+    # дать обычной маршрутизации по кнопкам меню случайно перехватить текст.
+    current_fsm_state = await state.get_state()
+
+    if current_fsm_state == FeedbackStates.waiting_for_comment.state:
+        data = await state.get_data()
+        await save_feedback(
+            user_id=user_id,
+            category=data.get("category_code", "unknown"),
+            rating=data.get("rating", 0),
+            comment=text.strip() or None,
+        )
+        await state.clear()
+        await message.answer(
+            "✅ Спасибо за feedback! Ваш отзыв сохранён и поможет улучшить Language Exchange Bot.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    if current_fsm_state in (
+        FeedbackStates.waiting_for_category.state,
+        FeedbackStates.waiting_for_rating.state,
+    ):
+        # Пользователь написал текст вместо нажатия inline-кнопки — мягко
+        # напоминаем, а не проваливаемся в обычную маршрутизацию меню.
+        await message.answer("Пожалуйста, используйте кнопки выше 👆 (или «◀️ Назад», чтобы отменить).")
+        return
 
     await ensure_user(user_id, message.from_user.username)
     user = await get_user(user_id)
@@ -853,6 +1117,15 @@ async def unified_text_handler(message: Message) -> None:
         user_settings_msg[user_id] = msg.message_id
         return
 
+    # UPDATE: точка входа в сценарий "📝 Обратная связь" — запускаем FSM.
+    if "Обратная связь" in text:
+        await state.set_state(FeedbackStates.waiting_for_category)
+        await message.answer(
+            "📝 Обратная связь\n\nВыберите категорию отзыва:",
+            reply_markup=feedback_category_keyboard(),
+        )
+        return
+
     if "Статистика" in text:
         await show_stats(message, user)
         return
@@ -875,21 +1148,47 @@ async def show_profile(message: Message, user: aiosqlite.Row) -> None:
     )
 
 
+# UPDATE: show_stats переписан на реальную агрегацию по БД одним запросом
+# вместо трёх отдельных SELECT'ов, плюс добавлены total_chats и global_rating.
 async def show_stats(message: Message, user: aiosqlite.Row) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT COUNT(*) FROM users")
-        total_users = (await cursor.fetchone())[0]
-        cursor = await db.execute("SELECT COUNT(*) FROM users WHERE status = 'searching'")
-        searching_now = (await cursor.fetchone())[0]
-        cursor = await db.execute("SELECT COUNT(*) FROM users WHERE status = 'chatting'")
-        chatting_now = (await cursor.fetchone())[0]
+        cursor = await db.execute(
+            """
+            SELECT
+                COUNT(*) AS total_users,
+                SUM(CASE WHEN status = 'searching' THEN 1 ELSE 0 END) AS searching_now,
+                SUM(CASE WHEN status = 'chatting' THEN 1 ELSE 0 END) AS chatting_now,
+                SUM(completed_chats) AS total_completed_chats,
+                AVG(CASE WHEN rating_count > 0 THEN rating END) AS global_rating
+            FROM users
+            """
+        )
+        row = await cursor.fetchone()
+
+    total_users = row[0] or 0
+    searching_now = row[1] or 0
+    # completed_chats и status='chatting' выставляются/инкрементируются
+    # обеим сторонам диалога одновременно, поэтому реальное число пар
+    # и реальное число завершённых диалогов — это сырое значение / 2.
+    chatting_now = (row[2] or 0) // 2
+    total_chats = (row[3] or 0) // 2
+    global_rating = round(row[4], 2) if row[4] is not None else 0.0
+
+    user_completed = user["completed_chats"] or 0
+    user_rating = round(user["rating"] or 5.0, 2)
+    user_ratings_count = user["rating_count"] or 0
 
     await message.answer(
-        "📊 <b>Статистика бота</b>\n\n"
-        f"Всего пользователей: <b>{total_users}</b>\n"
-        f"Сейчас ищут собеседника: <b>{searching_now}</b>\n"
-        f"Сейчас общаются: <b>{chatting_now // 2 if chatting_now else 0}</b> пар\n\n"
-        f"Ваш личный рейтинг: <b>{round(user['rating'] or 5.0, 2)} ⭐️</b>"
+        "📊 <b>Статистика бота</b>\n"
+        f"👥 Всего пользователей: <b>{total_users}</b>\n"
+        f"🔍 Сейчас ищут собеседника: <b>{searching_now}</b>\n"
+        f"💬 Сейчас общаются: <b>{chatting_now}</b> пар\n"
+        f"🗣️ Всего диалогов: <b>{total_chats}</b>\n"
+        f"⭐ Средний рейтинг: <b>{global_rating}</b>\n"
+        "👤 <b>Ваша статистика</b>\n"
+        f"💬 Завершённых диалогов: <b>{user_completed}</b>\n"
+        f"⭐ Ваш рейтинг: <b>{user_rating}</b>\n"
+        f"📝 Получено оценок: <b>{user_ratings_count}</b>"
     )
 
 
