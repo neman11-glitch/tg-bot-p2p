@@ -308,12 +308,15 @@ async def save_feedback(user_id: int, category: str, rating: int, comment: str |
         await db.commit()
 
 
-# UPDATE: find_partner теперь ищет двусторонний матч по уровням.
-# Раньше матч строился только по partner_level кандидата, из-за чего
-# пара могла сойтись, даже если кандидату не подходил уровень ищущего.
-# Теперь оба условия обязательны:
-#   - candidate.my_level      == искомый уровень собеседника (partner_level ищущего)
-#   - candidate.partner_level == собственный уровень ищущего (my_level ищущего)
+# UPDATE: find_partner теперь двухступенчатый.
+#   1) Точный матч: тема + двусторонний уровень (как раньше).
+#   2) Фолбэк: если точного матча нет — берём ЛЮБОГО пользователя со
+#      статусом 'searching' (кроме себя и забаненных), игнорируя тему и
+#      уровни. Это осознанное решение для стадии бета-тестирования: сейчас
+#      живых пользователей мало, и строгий фильтр приводит к тому, что два
+#      одновременно ищущих человека не находят друг друга из-за небольшого
+#      расхождения в настройках. Точный матч всегда имеет приоритет —
+#      фолбэк применяется только если он не нашёлся.
 async def find_partner(user_id: int, topic: str, my_level: str, partner_level: str) -> int | None:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
@@ -330,6 +333,22 @@ async def find_partner(user_id: int, topic: str, my_level: str, partner_level: s
             (user_id, topic, partner_level, my_level),
         )
         row = await cursor.fetchone()
+        if row:
+            return row[0]
+
+        # Фолбэк: любой другой ищущий пользователь, без фильтров.
+        cursor = await db.execute(
+            """
+            SELECT user_id FROM users
+            WHERE status = 'searching'
+              AND is_banned = 0
+              AND user_id != ?
+            ORDER BY user_id ASC
+            LIMIT 1
+            """,
+            (user_id,),
+        )
+        row = await cursor.fetchone()
         return row[0] if row else None
 
 
@@ -344,6 +363,20 @@ MENU_STATS = "📊 Статистика"
 MENU_STOP = "❌ Завершить диалог"
 # UPDATE: новая кнопка обратной связи.
 MENU_FEEDBACK = "📝 Обратная связь"
+
+# UPDATE: набор точных текстов кнопок главного меню. Используется, чтобы
+# ЛЮБОЙ активный режим (AI-чат, ожидание feedback-комментария, обычный
+# p2p-чат) гарантированно уступал место нажатию кнопки меню — раньше
+# статус 'ai_chat' перехватывал текст кнопки и отправлял его в AI как
+# обычное сообщение, из-за чего пользователь застревал в AI-режиме.
+MENU_BUTTON_TEXTS = {
+    MENU_SEARCH,
+    MENU_PROFILE,
+    MENU_SETTINGS,
+    MENU_STATS,
+    MENU_STOP,
+    MENU_FEEDBACK,
+}
 
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
@@ -1164,10 +1197,92 @@ async def remove_stale_settings_menu(user_id: int) -> None:
             pass
 
 
+# UPDATE: единая точка входа для кнопок главного меню (Reply Keyboard).
+# ГЛАВНОЕ ИСПРАВЛЕНИЕ БАГА №1: раньше эти кнопки распознавались только
+# внутри ветки status == 'idle', которая проверялась ПОСЛЕ веток
+# status == 'chatting' / 'ai_chat'. Из-за этого нажатие "🔍 Найти
+# собеседника" в режиме AI-Репетитора перехватывалось AI-хэндлером и
+# уходило в get_ai_reply() как обычный текст — бот отвечал в духе "не могу
+# подключить собеседника" по кругу, а сама кнопка не работала.
+#
+# Теперь unified_text_handler проверяет ТОЧНОЕ совпадение текста с одной
+# из кнопок меню (MENU_BUTTON_TEXTS) в первую очередь — раньше любых
+# FSM-состояний и любых status-веток (ai_chat / chatting / searching).
+# Это гарантирует, что нажатие кнопки меню ВСЕГДА выполняет команду, а не
+# перехватывается AI-чатом или ожиданием feedback-комментария.
+async def handle_menu_button(message: Message, state: FSMContext, text: str) -> None:
+    user_id = message.from_user.id
+
+    # Сбрасываем любое активное FSM-состояние ПЕРВЫМ делом — по требованию:
+    # "explicitly run state.clear() FIRST to instantly drop any active AI
+    # or FSM states". Сам AI-чат хранится не во FSM, а в status='ai_chat' в
+    # БД, поэтому ниже он завершается отдельно через end_chat().
+    await state.clear()
+
+    await ensure_user(user_id, message.from_user.username)
+    user = await get_user(user_id)
+    if user is None:
+        return
+
+    if user["is_banned"]:
+        await message.answer("🚫 Ваш аккаунт заблокирован за нарушения правил.")
+        return
+
+    status = user["status"]
+    await remove_stale_settings_menu(user_id)
+
+    if text == MENU_STOP:
+        if status in ("chatting", "ai_chat"):
+            await end_chat(user_id)
+        else:
+            await message.answer("У вас нет активного диалога.", reply_markup=main_menu_keyboard())
+        return
+
+    if text == MENU_SEARCH:
+        # Если пользователь был в AI-режиме или в обычном чате — сначала
+        # корректно завершаем текущую сессию (партнёр, если есть, получит
+        # уведомление), и только затем запускаем новый поиск.
+        if status in ("chatting", "ai_chat"):
+            await end_chat(user_id)
+        elif status == "searching":
+            cancel_search_task(user_id)
+        await start_search(user_id)
+        return
+
+    if text == MENU_PROFILE:
+        await show_profile(message, user)
+        return
+
+    if text == MENU_SETTINGS:
+        msg = await message.answer(
+            "⚙️ Настройка параметров поиска собеседника:", reply_markup=settings_menu_keyboard()
+        )
+        user_settings_msg[user_id] = msg.message_id
+        return
+
+    if text == MENU_FEEDBACK:
+        await state.set_state(FeedbackStates.waiting_for_category)
+        await message.answer(
+            "📝 Обратная связь\n\nВыберите категорию отзыва:",
+            reply_markup=feedback_category_keyboard(),
+        )
+        return
+
+    if text == MENU_STATS:
+        await show_stats(message, user)
+        return
+
+
 @router.message(F.text)
 async def unified_text_handler(message: Message, state: FSMContext) -> None:
     user_id = message.from_user.id
     text = message.text or ""
+
+    # UPDATE: кнопки главного меню обрабатываются ПЕРВЫМИ, до любых
+    # FSM/AI/статусных веток — см. подробный комментарий у handle_menu_button.
+    if text in MENU_BUTTON_TEXTS:
+        await handle_menu_button(message, state, text)
+        return
 
     # UPDATE: перехват шага "комментарий" сценария обратной связи.
     # Проверяем это ДО ensure_user/is_banned/status-веток, чтобы не зависеть
@@ -1211,13 +1326,9 @@ async def unified_text_handler(message: Message, state: FSMContext) -> None:
 
     status = user["status"]
 
-    # --- Кнопка завершения активного диалога (чат или AI) ---
-    if text == MENU_STOP and status in ("chatting", "ai_chat"):
-        await remove_stale_settings_menu(user_id)
-        await end_chat(user_id)
-        return
-
     # --- Пользователь находится в обычном чате с собеседником ---
+    # (Кнопка "❌ Завершить диалог" сюда уже не долетает — она перехватывается
+    # раньше, в handle_menu_button, вместе со всеми остальными кнопками меню.)
     if status == "chatting":
         partner_id = user["partner_id"]
         if not partner_id:
