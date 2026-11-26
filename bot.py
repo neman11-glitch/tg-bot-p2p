@@ -58,6 +58,15 @@ except ValueError as exc:
         f"ADMIN_ID должен быть числом, получено: {_admin_id_raw!r}"
     ) from exc
 
+# SECURITY (SAFE-01): P2P-поиск собеседника временно отключён, пока не
+# добавлены возрастной шаг, правила, блокировка и жалобы во время диалога.
+# Включить можно только явно: P2P_ENABLED=1 в переменных окружения.
+P2P_ENABLED = os.getenv("P2P_ENABLED", "0").strip() == "1"
+P2P_DISABLED_TEXT = (
+    "⏸ Поиск собеседника временно отключён: мы улучшаем безопасность общения.\n"
+    "Пока можно практиковаться с AI-Репетитором."
+)
+
 DB_PATH = "language_exchange.db"
 GROQ_MODEL = "openai/gpt-oss-120b"
 SEARCH_TIMEOUT_SECONDS = 30
@@ -520,6 +529,20 @@ async def start_search(user_id: int) -> None:
 
     if user["is_banned"]:
         await bot.send_message(user_id, "🚫 Ваш аккаунт заблокирован за нарушения.")
+        return
+
+    # SECURITY (SAFE-01): единая точка входа в P2P — все пути (кнопка меню,
+    # текст, "Искать снова") проходят через start_search.
+    if not P2P_ENABLED:
+        if user["status"] == "searching":
+            await update_user(user_id, status="idle")
+        await bot.send_message(
+            user_id,
+            P2P_DISABLED_TEXT,
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="🤖 Перейти к AI-Репетитору", callback_data="go_ai_tutor")]]
+            ),
+        )
         return
 
     await update_user(user_id, status="searching")
@@ -1488,6 +1511,7 @@ async def start_health_check() -> None:
 
 async def main() -> None:
     await init_db()
+    logger.info("P2P-поиск: %s", "ВКЛЮЧЁН" if P2P_ENABLED else "отключён (P2P_ENABLED != 1)")
     await start_health_check()
     logger.info("Бот запускается...")
     try:
