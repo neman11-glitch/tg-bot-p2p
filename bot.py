@@ -257,10 +257,13 @@ async def open_db_pool() -> None:
     async def _init(conn):
         await conn.execute("SET search_path TO bot")
 
+    # Пароль можно хранить отдельно в DB_PASSWORD: тогда в нём допустимы любые
+    # символы и его не нужно кодировать внутри адреса.
+    db_password = os.getenv("DB_PASSWORD") or None
     # statement_cache_size=0 — совместимость с пулером Supabase.
     _pg_pool = await asyncpg.create_pool(
-        DATABASE_URL, min_size=1, max_size=5, statement_cache_size=0,
-        command_timeout=15, init=_init,
+        DATABASE_URL, password=db_password, min_size=1, max_size=5,
+        statement_cache_size=0, command_timeout=15, init=_init,
     )
 
 
