@@ -3,6 +3,7 @@ load_dotenv()
 
 import asyncio
 import csv
+import html
 import io
 import logging
 from datetime import datetime
@@ -106,6 +107,14 @@ TOPICS = [
     "✈️Путешествия",
     "🎵Музыка",
 ]
+# SECURITY (BOT-05): белые списки значений из callback_data.
+VALID_LEVEL_CODES = {code for code, _ in LEVELS}
+VALID_TOPICS = set(TOPICS)
+STALE_BUTTON_TEXT = "Эта кнопка устарела."
+
+# SECURITY (BOT-02): поиск пары и связывание выполняются под одной блокировкой,
+# чтобы два одновременных поиска не захватили одного и того же собеседника.
+match_lock = asyncio.Lock()
 
 # UPDATE: категории для системы обратной связи. Формат (code, label) —
 # code уходит в callback_data и в колонку feedback.category, label — это
@@ -158,6 +167,8 @@ USERS_TABLE_SCHEMA = {
     # PRAGMA table_info и добавляет их через ALTER TABLE автоматически.
     "completed_chats": "INTEGER DEFAULT 0",
     "created_at": "TIMESTAMP",
+    # SECURITY (BOT-01): текущая сессия диалога, к которой привязаны оценки и жалобы.
+    "current_session_id": "INTEGER",
 }
 
 
@@ -194,6 +205,37 @@ async def init_db() -> None:
             )
             """
         )
+        # SECURITY (BOT-01): сессии диалогов и одна оценка на участника сессии.
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_a INTEGER NOT NULL,
+                user_b INTEGER NOT NULL,
+                started_at TEXT,
+                ended_at TEXT
+            )
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ratings (
+                session_id INTEGER NOT NULL,
+                rater_id INTEGER NOT NULL,
+                target_id INTEGER NOT NULL,
+                score INTEGER NOT NULL CHECK (score BETWEEN 1 AND 5),
+                created_at TEXT,
+                PRIMARY KEY (session_id, rater_id)
+            )
+            """
+        )
+        cursor = await db.execute("PRAGMA table_info(reports)")
+        if "session_id" not in {row[1] for row in await cursor.fetchall()}:
+            await db.execute("ALTER TABLE reports ADD COLUMN session_id INTEGER")
+        await db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS reports_session_reporter "
+            "ON reports(session_id, reporter_id)"
+        )
         await db.commit()
 
         # Проверка структуры users через PRAGMA table_info и добавление
@@ -228,9 +270,13 @@ async def init_db() -> None:
             await db.execute(
                 """
                 UPDATE users
-                SET status = 'idle', partner_id = NULL
+                SET status = 'idle', partner_id = NULL, current_session_id = NULL
                 WHERE status IN ('searching', 'chatting', 'ai_chat')
                 """
+            )
+            await db.execute(
+                "UPDATE chat_sessions SET ended_at = ? WHERE ended_at IS NULL",
+                (datetime.utcnow().isoformat(),),
             )
             await db.commit()
             logger.info("Сброшено зомби-сессий при старте: %s", zombie_count)
@@ -288,23 +334,98 @@ async def increment_completed_chats(user_id: int) -> None:
         await db.commit()
 
 
-async def add_report(reporter_id: int, reported_id: int) -> int:
+async def create_session(user_a: int, user_b: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "INSERT INTO chat_sessions (user_a, user_b, started_at) VALUES (?, ?, ?)",
+            (user_a, user_b, datetime.utcnow().isoformat()),
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def close_session(session_id: int | None) -> None:
+    if not session_id:
+        return
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO reports (reporter_id, reported_id, created_at) VALUES (?, ?, ?)",
-            (reporter_id, reported_id, datetime.utcnow().isoformat()),
+            "UPDATE chat_sessions SET ended_at = ? WHERE id = ? AND ended_at IS NULL",
+            (datetime.utcnow().isoformat(), session_id),
         )
         await db.commit()
+
+
+async def get_session_counterpart(session_id: int, user_id: int) -> int | None:
+    """SECURITY (BOT-01): возвращает собеседника, только если user_id был
+    участником этой сессии и сессия уже завершена. Иначе None."""
+    async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT reports_count FROM users WHERE user_id = ?", (reported_id,)
+            "SELECT user_a, user_b, ended_at FROM chat_sessions WHERE id = ?", (session_id,)
         )
         row = await cursor.fetchone()
-        new_count = (row[0] if row and row[0] else 0) + 1
+    if row is None or row[2] is None:
+        return None
+    user_a, user_b, _ = row
+    if user_id == user_a:
+        return user_b
+    if user_id == user_b:
+        return user_a
+    return None
+
+
+async def add_rating(session_id: int, rater_id: int, target_id: int, score: int) -> bool:
+    """Одна оценка на участника сессии. Рейтинг пересчитывается из таблицы
+    ratings целиком, без read-then-write гонки. False — уже оценивал."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute(
+                "INSERT INTO ratings (session_id, rater_id, target_id, score, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (session_id, rater_id, target_id, score, datetime.utcnow().isoformat()),
+            )
+        except aiosqlite.IntegrityError:
+            return False
         await db.execute(
-            "UPDATE users SET reports_count = ? WHERE user_id = ?", (new_count, reported_id)
+            """
+            UPDATE users SET
+                rating = (SELECT ROUND(AVG(score), 2) FROM ratings WHERE target_id = ?),
+                rating_count = (SELECT COUNT(*) FROM ratings WHERE target_id = ?)
+            WHERE user_id = ?
+            """,
+            (target_id, target_id, target_id),
         )
         await db.commit()
-        return new_count
+        return True
+
+
+async def add_report(session_id: int, reporter_id: int, reported_id: int) -> int | None:
+    """Одна жалоба на участника сессии. Возвращает число РАЗНЫХ жалобщиков
+    на этого пользователя или None, если жалоба по этой сессии уже была."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute(
+                "INSERT INTO reports (session_id, reporter_id, reported_id, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (session_id, reporter_id, reported_id, datetime.utcnow().isoformat()),
+            )
+        except aiosqlite.IntegrityError:
+            return None
+        cursor = await db.execute(
+            "SELECT COUNT(DISTINCT reporter_id) FROM reports WHERE reported_id = ?",
+            (reported_id,),
+        )
+        distinct_reporters = (await cursor.fetchone())[0]
+        await db.execute(
+            "UPDATE users SET reports_count = ? WHERE user_id = ?",
+            (distinct_reporters, reported_id),
+        )
+        await db.commit()
+        return distinct_reporters
+
+
+async def is_user_banned(user_id: int) -> bool:
+    user = await get_user(user_id)
+    return bool(user and user["is_banned"])
 
 
 # UPDATE: сохранение отзыва в таблицу feedback.
@@ -445,17 +566,18 @@ def after_search_timeout_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-# UPDATE: лайк/дизлайк заменены на 5-звёздочную оценку.
-# callback_data теперь имеет вид fb_rate_{partner_id}_{score}, где score от 1 до 5.
-def feedback_keyboard(partner_id: int) -> InlineKeyboardMarkup:
+# SECURITY (BOT-01): кнопки ссылаются на сессию, а не на ID собеседника.
+# Формат: fb_rate_{session_id}_{score}, fb_report_{session_id}. Кого оценивают,
+# определяет сервер по таблице chat_sessions, а не клиент.
+def feedback_keyboard(session_id: int) -> InlineKeyboardMarkup:
     star_buttons = [
-        InlineKeyboardButton(text=f"{score}⭐️", callback_data=f"fb_rate_{partner_id}_{score}")
+        InlineKeyboardButton(text=f"{score}⭐️", callback_data=f"fb_rate_{session_id}_{score}")
         for score in range(1, 6)
     ]
     return InlineKeyboardMarkup(
         inline_keyboard=[
             star_buttons,
-            [InlineKeyboardButton(text="🚨 Пожаловаться", callback_data=f"fb_report_{partner_id}")],
+            [InlineKeyboardButton(text="🚨 Пожаловаться", callback_data=f"fb_report_{session_id}")],
         ]
     )
 
@@ -545,17 +667,24 @@ async def start_search(user_id: int) -> None:
         )
         return
 
-    await update_user(user_id, status="searching")
+    # SECURITY (BOT-02): проверка статусов, поиск и связывание — атомарно.
+    async with match_lock:
+        user = await get_user(user_id)
+        if user is None or user["status"] in ("chatting", "ai_chat"):
+            return
+        await update_user(user_id, status="searching")
 
-    # UPDATE: передаём и my_level, и partner_level ищущего — find_partner
-    # теперь матчит по обоим условиям одновременно (двусторонний матч).
-    partner_id = await find_partner(user_id, user["topic"], user["my_level"], user["partner_level"])
+        # UPDATE: передаём и my_level, и partner_level ищущего — find_partner
+        # теперь матчит по обоим условиям одновременно (двусторонний матч).
+        partner_id = await find_partner(user_id, user["topic"], user["my_level"], user["partner_level"])
+
+        if partner_id:
+            session_id = await create_session(user_id, partner_id)
+            await update_user(user_id, status="chatting", partner_id=partner_id, current_session_id=session_id)
+            await update_user(partner_id, status="chatting", partner_id=user_id, current_session_id=session_id)
 
     if partner_id:
         cancel_search_task(partner_id)
-        await update_user(user_id, status="chatting", partner_id=partner_id)
-        await update_user(partner_id, status="chatting", partner_id=user_id)
-
         partner = await get_user(partner_id)
 
         await bot.send_message(
@@ -585,9 +714,10 @@ async def end_chat(user_id: int, notify_partner: bool = True) -> None:
         return
 
     partner_id = user["partner_id"]
+    session_id = user["current_session_id"]
     was_chatting = user["status"] in ("chatting", "ai_chat") and partner_id
 
-    await update_user(user_id, status="idle", partner_id=None)
+    await update_user(user_id, status="idle", partner_id=None, current_session_id=None)
     ai_histories.pop(user_id, None)
 
     if user["status"] == "ai_chat":
@@ -595,7 +725,14 @@ async def end_chat(user_id: int, notify_partner: bool = True) -> None:
         return
 
     if was_chatting:
-        await update_user(partner_id, status="idle", partner_id=None)
+        # Отвязываем собеседника, только если он действительно связан с нами.
+        partner = await get_user(partner_id)
+        if partner and partner["partner_id"] == user_id:
+            await update_user(partner_id, status="idle", partner_id=None, current_session_id=None)
+        await close_session(session_id)
+        if not session_id:
+            await bot.send_message(user_id, "Вы вернулись в главное меню.", reply_markup=main_menu_keyboard())
+            return
 
         # UPDATE: засчитываем завершённый диалог обеим сторонам. К этой
         # точке status уже гарантированно 'chatting' (ветка 'ai_chat' выше
@@ -606,18 +743,18 @@ async def end_chat(user_id: int, notify_partner: bool = True) -> None:
         await bot.send_message(
             user_id,
             "Диалог завершён. Оцените, пожалуйста, вашего собеседника:",
-            reply_markup=feedback_keyboard(partner_id),
+            reply_markup=feedback_keyboard(session_id),
         )
         if notify_partner:
             try:
                 await bot.send_message(
                     partner_id,
                     "Собеседник завершил диалог. Оцените, пожалуйста, общение:",
-                    reply_markup=feedback_keyboard(user_id),
+                    reply_markup=feedback_keyboard(session_id),
                 )
-            except TelegramForbiddenError:
-                logger.info("Пользователь %s заблокировал бота.", partner_id)
-        await bot.send_message(partner_id, "Возврат в главное меню.", reply_markup=main_menu_keyboard())
+                await bot.send_message(partner_id, "Возврат в главное меню.", reply_markup=main_menu_keyboard())
+            except (TelegramForbiddenError, TelegramBadRequest):
+                logger.info("Не удалось уведомить пользователя %s о завершении диалога.", partner_id)
         await bot.send_message(user_id, "Возврат в главное меню.", reply_markup=main_menu_keyboard())
     else:
         await bot.send_message(user_id, "Вы вернулись в главное меню.", reply_markup=main_menu_keyboard())
@@ -680,9 +817,92 @@ async def cmd_start(message: Message) -> None:
         "Здесь вы можете найти собеседника для языковой практики или "
         "потренироваться с AI-Репетитором.\n\n"
         "Настройте параметры поиска через «⚙️ Настройка собеседника» "
-        "и нажмите «🔍 Найти собеседника», чтобы начать.",
+        "и нажмите «🔍 Найти собеседника», чтобы начать.\n\n"
+        "Какие данные мы храним: /privacy. Удалить свои данные: /delete_me.",
         reply_markup=main_menu_keyboard(),
     )
+
+
+# SECURITY (PRIV-01): краткое уведомление об обработке данных. Полная политика
+# конфиденциальности готовится на юридическом этапе; текст ниже описывает
+# фактическую работу этого кода.
+PRIVACY_TEXT = (
+    "🔒 <b>Какие данные хранит бот</b>\n\n"
+    "• Ваш Telegram ID и username (если есть), выбранные уровни и тема, рейтинг, "
+    "число завершённых диалогов, жалобы и ваши отзывы.\n"
+    "• Сообщения с собеседником бот не сохраняет: он только пересылает их через Telegram. "
+    "Собеседник не видит ваш ID и username, если вы сами их не напишете.\n"
+    "• Сообщения AI-Репетитору отправляются провайдеру Groq для генерации ответа; "
+    "бот держит последние 10 реплик в памяти до конца диалога. "
+    "Не пишите AI-Репетитору личные данные.\n"
+    "• Хостинг бота: Render (США).\n\n"
+    "Удалить свои данные: /delete_me"
+)
+
+
+@router.message(Command("privacy"))
+async def cmd_privacy(message: Message) -> None:
+    await message.answer(PRIVACY_TEXT)
+
+
+def delete_me_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="🗑 Да, удалить", callback_data="delme_confirm"),
+            InlineKeyboardButton(text="Отмена", callback_data="delme_cancel"),
+        ]]
+    )
+
+
+@router.message(Command("delete_me"))
+async def cmd_delete_me(message: Message) -> None:
+    await message.answer(
+        "Удалить ваш профиль, рейтинг, оценки и отзывы из бота? Это нельзя отменить.\n"
+        "Жалобы других пользователей на вас и отметка о блокировке сохраняются "
+        "для безопасности сообщества.",
+        reply_markup=delete_me_keyboard(),
+    )
+
+
+async def delete_user_data(user_id: int) -> None:
+    """Удаляет данные пользователя. Если пользователь заблокирован, остаётся
+    только строка с ID и флагом бана, чтобы удаление не снимало блокировку."""
+    cancel_search_task(user_id)
+    ai_histories.pop(user_id, None)
+    user_settings_msg.pop(user_id, None)
+    user = await get_user(user_id)
+    if user and user["status"] in ("chatting", "ai_chat"):
+        await end_chat(user_id)
+        user = await get_user(user_id)
+    banned = bool(user and user["is_banned"])
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM feedback WHERE user_id = ?", (user_id,))
+        await db.execute("DELETE FROM ratings WHERE rater_id = ? OR target_id = ?", (user_id, user_id))
+        await db.execute("UPDATE reports SET reporter_id = NULL WHERE reporter_id = ?", (user_id,))
+        await db.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+        if banned:
+            await db.execute("INSERT INTO users (user_id, username, is_banned) VALUES (?, '', 1)", (user_id,))
+        await db.commit()
+
+
+@router.callback_query(F.data == "delme_confirm")
+async def cb_delete_me_confirm(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.clear()
+    await delete_user_data(callback.from_user.id)
+    try:
+        await callback.message.edit_text("✅ Ваши данные удалены.", reply_markup=None)
+    except TelegramBadRequest:
+        pass
+
+
+@router.callback_query(F.data == "delme_cancel")
+async def cb_delete_me_cancel(callback: CallbackQuery) -> None:
+    await callback.answer()
+    try:
+        await callback.message.edit_text("Удаление отменено.", reply_markup=None)
+    except TelegramBadRequest:
+        pass
 
 
 @router.message(Command("reports"))
@@ -748,7 +968,7 @@ async def cmd_feedback_stats(message: Message) -> None:
     bug_count = 0
     suggestion_count = 0
     for category_code, count, cat_avg_rating in category_rows:
-        label = category_labels.get(category_code, category_code)
+        label = html.escape(str(category_labels.get(category_code, category_code)))
         cat_avg = round(cat_avg_rating, 2) if cat_avg_rating is not None else 0.0
         lines.append(f"{label}: <b>{count}</b> (ср. {cat_avg}⭐)")
         if category_code == "bug":
@@ -814,14 +1034,16 @@ async def _send_feedback_comments(
     current = header
 
     for row in comment_rows:
+        # SECURITY (BOT-05): всё, что ввёл пользователь, экранируется перед HTML.
         username = row["username"]
-        user_ref = f"@{username}" if username else f"ID <code>{row['user_id']}</code>"
-        label = category_labels.get(row["category"], row["category"] or "—")
+        user_ref = f"@{html.escape(username)}" if username else f"ID <code>{row['user_id']}</code>"
+        label = html.escape(category_labels.get(row["category"], row["category"] or "—"))
         stars = "⭐" * max(0, min(5, row["rating"] or 0))
 
         comment_text = row["comment"] or ""
         if len(comment_text) > FEEDBACK_COMMENT_MAX_LEN:
             comment_text = comment_text[:FEEDBACK_COMMENT_MAX_LEN].rstrip() + "…"
+        comment_text = html.escape(comment_text)
 
         entry = (
             f"\n👤 {user_ref} | {label}\n"
@@ -886,15 +1108,21 @@ async def cmd_download_feedback(message: Message) -> None:
     writer.writerow(
         ["id", "user_id", "username", "category", "rating", "comment", "created_at"]
     )
+    # SECURITY (BOT-07): ячейки, похожие на формулу, экранируются апострофом,
+    # чтобы Excel/Sheets не исполнил их при открытии файла.
+    def safe_cell(value) -> str:
+        text = "" if value is None else str(value)
+        return "'" + text if text[:1] in ("=", "+", "-", "@", "\t", "\r") else text
+
     for row in rows:
         writer.writerow(
             [
                 row["id"],
                 row["user_id"],
-                row["username"] or "",
-                category_labels.get(row["category"], row["category"] or ""),
+                safe_cell(row["username"]),
+                safe_cell(category_labels.get(row["category"], row["category"] or "")),
                 row["rating"] if row["rating"] is not None else "",
-                row["comment"] or "",
+                safe_cell(row["comment"]),
                 row["created_at"],
             ]
         )
@@ -930,8 +1158,24 @@ async def cmd_ban(message: Message) -> None:
     await message.answer(f"🚫 Пользователь {target_id} забанен.")
     try:
         await bot.send_message(target_id, "🚫 Вы были заблокированы администратором за нарушения.")
-    except TelegramForbiddenError:
+    except (TelegramForbiddenError, TelegramBadRequest):
         pass
+
+
+# SECURITY (BOT-06): снятие бана, в том числе ошибочного автобана.
+@router.message(Command("unban"))
+async def cmd_unban(message: Message) -> None:
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) != 2 or not parts[1].strip().lstrip("-").isdigit():
+        await message.answer("Использование: /unban <user_id>")
+        return
+
+    target_id = int(parts[1].strip())
+    await update_user(target_id, is_banned=0)
+    await message.answer(f"✅ Пользователь {target_id} разбанен.")
 
 
 # =============================================================================
@@ -976,10 +1220,17 @@ async def cb_settings_topic(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("setlevel_"))
 async def cb_set_level(callback: CallbackQuery) -> None:
-    await callback.answer()
-
-    _, target, level_code = callback.data.split("_")
     user_id = callback.from_user.id
+    parts = callback.data.split("_")
+    # SECURITY (BOT-05/06): только значения из белого списка, бан проверяется.
+    if len(parts) != 3 or parts[1] not in ("my", "partner") or parts[2] not in VALID_LEVEL_CODES:
+        await callback.answer(STALE_BUTTON_TEXT)
+        return
+    if await is_user_banned(user_id):
+        await callback.answer("🚫 Ваш аккаунт заблокирован.")
+        return
+    await callback.answer()
+    _, target, level_code = parts
 
     if target == "my":
         await update_user(user_id, my_level=level_code)
@@ -997,9 +1248,15 @@ async def cb_set_level(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("settopic_"))
 async def cb_set_topic(callback: CallbackQuery) -> None:
-    await callback.answer()
-
     topic = callback.data.removeprefix("settopic_")
+    # SECURITY (BOT-05/06): тема только из списка TOPICS.
+    if topic not in VALID_TOPICS:
+        await callback.answer(STALE_BUTTON_TEXT)
+        return
+    if await is_user_banned(callback.from_user.id):
+        await callback.answer("🚫 Ваш аккаунт заблокирован.")
+        return
+    await callback.answer()
     await update_user(callback.from_user.id, topic=topic)
 
     try:
@@ -1025,10 +1282,21 @@ async def cb_back_to_settings(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "go_ai_tutor")
 async def cb_go_ai_tutor(callback: CallbackQuery) -> None:
-    await callback.answer()
-
     user_id = callback.from_user.id
-    await update_user(user_id, status="ai_chat", partner_id=None)
+    await ensure_user(user_id, callback.from_user.username)
+    user = await get_user(user_id)
+    # SECURITY (BOT-03/06): забаненным нельзя; живой диалог сначала корректно
+    # завершается, чтобы собеседник не остался привязанным.
+    if user is None or user["is_banned"]:
+        await callback.answer("🚫 Ваш аккаунт заблокирован.")
+        return
+    await callback.answer()
+    if user["status"] == "chatting":
+        await end_chat(user_id)
+    elif user["status"] == "searching":
+        cancel_search_task(user_id)
+
+    await update_user(user_id, status="ai_chat", partner_id=None, current_session_id=None)
     ai_histories[user_id] = []
 
     try:
@@ -1051,6 +1319,10 @@ async def cb_search_again(callback: CallbackQuery) -> None:
         await callback.message.edit_text("🔄 Запускаю поиск заново...", reply_markup=None)
     except TelegramBadRequest:
         pass
+    # SECURITY (BOT-03): старая кнопка не должна ломать текущий диалог.
+    user = await get_user(callback.from_user.id)
+    if user and user["status"] in ("chatting", "ai_chat"):
+        await end_chat(callback.from_user.id)
     await start_search(callback.from_user.id)
 
 
@@ -1062,26 +1334,30 @@ async def cb_search_again(callback: CallbackQuery) -> None:
 # на отсутствие "_" внутри partner_id (id всегда числовой, но так надёжнее).
 @router.callback_query(F.data.startswith("fb_"))
 async def cb_feedback(callback: CallbackQuery) -> None:
-    await callback.answer()
-
     parts = callback.data.split("_")
-    action = parts[1]
     rater_id = callback.from_user.id
 
+    # SECURITY (BOT-01): строгий разбор формата и проверка, что нажавший
+    # действительно был участником завершённой сессии. Цель определяет сервер.
+    valid = (
+        (len(parts) == 4 and parts[1] == "rate" and parts[2].isdigit() and parts[3] in {"1", "2", "3", "4", "5"})
+        or (len(parts) == 3 and parts[1] == "report" and parts[2].isdigit())
+    )
+    if not valid:
+        await callback.answer(STALE_BUTTON_TEXT)
+        return
+    action, session_id = parts[1], int(parts[2])
+    target_id = await get_session_counterpart(session_id, rater_id)
+    if target_id is None:
+        await callback.answer(STALE_BUTTON_TEXT)
+        return
+
     if action == "rate":
-        # fb_rate_{partner_id}_{score} -> parts = ["fb", "rate", partner_id, score]
-        target_id = int(parts[2])
         score = int(parts[3])
-        score = max(1, min(5, score))  # защита от некорректного значения в callback_data
-
-        target_user = await get_user(target_id)
-        if target_user:
-            current_rating = target_user["rating"] or 5.0
-            current_count = target_user["rating_count"] or 0
-            new_count = current_count + 1
-            new_rating = ((current_rating * current_count) + score) / new_count
-            await update_user(target_id, rating=round(new_rating, 2), rating_count=new_count)
-
+        if not await add_rating(session_id, rater_id, target_id, score):
+            await callback.answer("Вы уже оценили этот диалог.")
+            return
+        await callback.answer()
         try:
             await callback.message.edit_text(
                 f"✅ Спасибо за оценку! Вы поставили {score}⭐️", reply_markup=None
@@ -1090,8 +1366,11 @@ async def cb_feedback(callback: CallbackQuery) -> None:
             pass
 
     elif action == "report":
-        target_id = int(parts[2])
-        new_count = await add_report(rater_id, target_id)
+        new_count = await add_report(session_id, rater_id, target_id)
+        if new_count is None:
+            await callback.answer("Жалоба по этому диалогу уже отправлена.")
+            return
+        await callback.answer()
 
         try:
             await bot.send_message(
@@ -1099,13 +1378,15 @@ async def cb_feedback(callback: CallbackQuery) -> None:
                 "🚨 <b>Новая жалоба!</b>\n"
                 f"Жалобщик: <code>{rater_id}</code>\n"
                 f"Нарушитель: <code>{target_id}</code>\n"
-                f"Всего жалоб на нарушителя: {new_count}\n\n"
+                f"Сессия: <code>{session_id}</code>\n"
+                f"Разных жалобщиков: {new_count}\n\n"
                 f"Забанить: <code>/ban {target_id}</code>",
             )
-        except TelegramForbiddenError:
-            logger.warning("Не удалось уведомить администратора: бот заблокирован админом.")
+        except (TelegramForbiddenError, TelegramBadRequest):
+            logger.warning("Не удалось уведомить администратора о жалобе.")
 
-        if new_count >= REPORTS_TO_BAN:
+        # Автобан только по жалобам от РАЗНЫХ людей и никогда для администратора.
+        if new_count >= REPORTS_TO_BAN and target_id != ADMIN_ID:
             await update_user(target_id, is_banned=1)
             target_user = await get_user(target_id)
             if target_user and target_user["status"] in ("chatting", "ai_chat") and target_user["partner_id"]:
@@ -1129,10 +1410,13 @@ async def cb_feedback(callback: CallbackQuery) -> None:
 # к следующему шагу или отмена по "◀️ Назад".
 @router.callback_query(FeedbackStates.waiting_for_category, F.data.startswith("fbs_cat_"))
 async def cb_feedback_category(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
-
     code = callback.data.removeprefix("fbs_cat_")
-    label = dict(FEEDBACK_CATEGORIES).get(code, code)
+    # SECURITY (BOT-05): только известные категории.
+    if code not in dict(FEEDBACK_CATEGORIES):
+        await callback.answer(STALE_BUTTON_TEXT)
+        return
+    await callback.answer()
+    label = dict(FEEDBACK_CATEGORIES)[code]
 
     await state.update_data(category_code=code, category_label=label)
     await state.set_state(FeedbackStates.waiting_for_rating)
@@ -1161,10 +1445,12 @@ async def cb_feedback_cancel(callback: CallbackQuery, state: FSMContext) -> None
 # Шаг 2: выбор оценки 1-5.
 @router.callback_query(FeedbackStates.waiting_for_rating, F.data.startswith("fbs_rate_"))
 async def cb_feedback_rating(callback: CallbackQuery, state: FSMContext) -> None:
+    raw_score = callback.data.removeprefix("fbs_rate_")
+    if raw_score not in {"1", "2", "3", "4", "5"}:
+        await callback.answer(STALE_BUTTON_TEXT)
+        return
     await callback.answer()
-
-    score = int(callback.data.removeprefix("fbs_rate_"))
-    score = max(1, min(5, score))  # защита от некорректного значения в callback_data
+    score = int(raw_score)
 
     await state.update_data(rating=score)
     await state.set_state(FeedbackStates.waiting_for_comment)
@@ -1354,8 +1640,15 @@ async def unified_text_handler(message: Message, state: FSMContext) -> None:
     # раньше, в handle_menu_button, вместе со всеми остальными кнопками меню.)
     if status == "chatting":
         partner_id = user["partner_id"]
-        if not partner_id:
-            await update_user(user_id, status="idle")
+        # SECURITY (BOT-03): пересылаем только при взаимной связи пары.
+        partner = await get_user(partner_id) if partner_id else None
+        if (
+            partner is None
+            or partner["status"] != "chatting"
+            or partner["partner_id"] != user_id
+            or partner["current_session_id"] != user["current_session_id"]
+        ):
+            await update_user(user_id, status="idle", partner_id=None, current_session_id=None)
             await message.answer("Диалог был прерван.", reply_markup=main_menu_keyboard())
             return
         try:
@@ -1365,8 +1658,9 @@ async def unified_text_handler(message: Message, state: FSMContext) -> None:
                 "⚠️ Собеседник заблокировал бота. Диалог завершён.",
                 reply_markup=main_menu_keyboard(),
             )
-            await update_user(user_id, status="idle", partner_id=None)
-            await update_user(partner_id, status="idle", partner_id=None)
+            await update_user(user_id, status="idle", partner_id=None, current_session_id=None)
+            await update_user(partner_id, status="idle", partner_id=None, current_session_id=None)
+            await close_session(user["current_session_id"])
         except TelegramBadRequest as exc:
             logger.warning("Не удалось переслать сообщение: %s", exc)
         return
@@ -1374,7 +1668,8 @@ async def unified_text_handler(message: Message, state: FSMContext) -> None:
     # --- Пользователь общается с AI-Репетитором ---
     if status == "ai_chat":
         reply = await get_ai_reply(user_id, user["my_level"], text)
-        await message.answer(reply)
+        # SECURITY (BOT-05): ответ модели — недоверенный текст, без HTML-разметки.
+        await message.answer(reply, parse_mode=None)
         return
 
     # --- Пользователь ожидает собеседника ---
@@ -1426,7 +1721,7 @@ async def show_profile(message: Message, user: aiosqlite.Row) -> None:
         "👤 <b>Ваш профиль</b>\n\n"
         f"Мой уровень: <b>{user['my_level'] or 'не указан'}</b>\n"
         f"Уровень собеседника: <b>{user['partner_level'] or 'не указан'}</b>\n"
-        f"Тема общения: <b>{user['topic']}</b>\n"
+        f"Тема общения: <b>{html.escape(user['topic'] or '')}</b>\n"
         f"Рейтинг: <b>{round(user['rating'] or 5.0, 2)} ⭐️</b> "
         f"({user['rating_count'] or 0} оценок)\n"
         f"Статус аккаунта: {ban_status}"
