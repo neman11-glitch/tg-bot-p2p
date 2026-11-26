@@ -69,6 +69,10 @@ P2P_DISABLED_TEXT = (
 )
 
 DB_PATH = "language_exchange.db"
+# SECURITY/OPS (BOT-04): если задан DATABASE_URL, данные хранятся в Postgres
+# (Supabase, схема bot), а не во временном файле SQLite, который стирается
+# при каждом деплое Render. Без DATABASE_URL — прежний SQLite (локально, тесты).
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 GROQ_MODEL = "openai/gpt-oss-120b"
 SEARCH_TIMEOUT_SECONDS = 30
 REPORTS_TO_BAN = 3
@@ -150,6 +154,193 @@ user_settings_msg: dict[int, int] = {}
 # 2. БАЗА ДАННЫХ И МИГРАЦИИ
 # =============================================================================
 
+# --- Слой доступа к БД (BOT-04) ----------------------------------------------
+# Весь код ниже работает через connect_db(): тот же интерфейс, что у
+# aiosqlite (execute -> cursor.fetchone/fetchall, commit), но с двумя
+# реализациями. SQL пишется с плейсхолдерами "?", для Postgres они
+# переводятся в $1, $2, ... Строки результата поддерживают row[0] и row["col"].
+
+try:
+    import asyncpg
+except ImportError:  # asyncpg нужен только при заданном DATABASE_URL
+    asyncpg = None
+
+_pg_pool = None
+DB_INTEGRITY_ERRORS: tuple = (aiosqlite.IntegrityError,)
+if asyncpg is not None:
+    DB_INTEGRITY_ERRORS = DB_INTEGRITY_ERRORS + (asyncpg.exceptions.IntegrityConstraintViolationError,)
+
+
+def using_postgres() -> bool:
+    return bool(DATABASE_URL)
+
+
+def to_pg_placeholders(sql: str) -> str:
+    """Заменяет ? на $1..$n вне строковых литералов."""
+    out, n, in_str = [], 0, False
+    for ch in sql:
+        if ch == "'":
+            in_str = not in_str
+        if ch == "?" and not in_str:
+            n += 1
+            out.append(f"${n}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+class _PgCursor:
+    def __init__(self, rows):
+        self._rows = rows
+
+    async def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+    async def fetchall(self):
+        return list(self._rows)
+
+
+class _PgConnection:
+    """Транзакция на время блока: commit() фиксирует и открывает новую,
+    выход без commit() откатывает — как у aiosqlite."""
+
+    def __init__(self):
+        self.row_factory = None  # совместимость с кодом, написанным под aiosqlite
+
+    async def __aenter__(self):
+        self._conn = await _pg_pool.acquire()
+        self._tx = self._conn.transaction()
+        await self._tx.start()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        try:
+            if self._tx is not None:
+                await self._tx.rollback()
+        finally:
+            await _pg_pool.release(self._conn)
+
+    async def execute(self, sql: str, params=()):
+        rows = await self._conn.fetch(to_pg_placeholders(sql), *params)
+        return _PgCursor(rows)
+
+    async def commit(self):
+        await self._tx.commit()
+        self._tx = self._conn.transaction()
+        await self._tx.start()
+
+
+class _SqliteConnection:
+    def __init__(self):
+        self._cm = aiosqlite.connect(DB_PATH)
+
+    async def __aenter__(self):
+        self._db = await self._cm.__aenter__()
+        self._db.row_factory = aiosqlite.Row
+        return self._db
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return await self._cm.__aexit__(exc_type, exc, tb)
+
+
+def connect_db():
+    return _PgConnection() if using_postgres() else _SqliteConnection()
+
+
+async def open_db_pool() -> None:
+    global _pg_pool
+    if not using_postgres():
+        return
+    if asyncpg is None:
+        raise RuntimeError("DATABASE_URL задан, но пакет asyncpg не установлен.")
+
+    async def _init(conn):
+        await conn.execute("SET search_path TO bot")
+
+    # statement_cache_size=0 — совместимость с пулером Supabase.
+    _pg_pool = await asyncpg.create_pool(
+        DATABASE_URL, min_size=1, max_size=5, statement_cache_size=0,
+        command_timeout=15, init=_init,
+    )
+
+
+async def db_ping() -> bool:
+    """Лёгкий запрос к БД. Вызывается из health-check (UptimeRobot раз в
+    5 минут), заодно не даёт бесплатному проекту Supabase уйти в паузу."""
+    if not using_postgres() or _pg_pool is None:
+        return True
+    try:
+        async with _pg_pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+        return True
+    except Exception as exc:  # health-check не должен падать
+        logger.warning("DB ping failed: %s", type(exc).__name__)
+        return False
+
+
+PG_SCHEMA = [
+    """
+    CREATE TABLE IF NOT EXISTS users (
+        user_id BIGINT PRIMARY KEY,
+        username TEXT,
+        my_level TEXT DEFAULT 'B1-B2',
+        partner_level TEXT DEFAULT 'B1-B2',
+        topic TEXT DEFAULT '☕️Разговоры обо всем',
+        status TEXT DEFAULT 'idle',
+        partner_id BIGINT,
+        rating DOUBLE PRECISION DEFAULT 5.0,
+        rating_count INTEGER DEFAULT 0,
+        reports_count INTEGER DEFAULT 0,
+        is_banned INTEGER DEFAULT 0,
+        completed_chats INTEGER DEFAULT 0,
+        created_at TEXT,
+        current_session_id BIGINT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS reports (
+        id BIGSERIAL PRIMARY KEY,
+        reporter_id BIGINT,
+        reported_id BIGINT,
+        created_at TEXT,
+        session_id BIGINT
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS reports_session_reporter
+    ON reports(session_id, reporter_id)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS feedback (
+        id BIGSERIAL PRIMARY KEY,
+        user_id BIGINT,
+        category TEXT,
+        rating INTEGER,
+        comment TEXT,
+        created_at TIMESTAMPTZ DEFAULT now()
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS chat_sessions (
+        id BIGSERIAL PRIMARY KEY,
+        user_a BIGINT NOT NULL,
+        user_b BIGINT NOT NULL,
+        started_at TEXT,
+        ended_at TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS ratings (
+        session_id BIGINT NOT NULL,
+        rater_id BIGINT NOT NULL,
+        target_id BIGINT NOT NULL,
+        score INTEGER NOT NULL CHECK (score BETWEEN 1 AND 5),
+        created_at TEXT,
+        PRIMARY KEY (session_id, rater_id)
+    )
+    """,
+]
+
 USERS_TABLE_SCHEMA = {
     "user_id": "INTEGER PRIMARY KEY",
     "username": "TEXT",
@@ -174,7 +365,17 @@ USERS_TABLE_SCHEMA = {
 
 async def init_db() -> None:
     """Создаёт таблицы и безопасно доводит структуру старых БД до актуальной."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    await open_db_pool()
+    if using_postgres():
+        async with connect_db() as db:
+            for ddl in PG_SCHEMA:
+                await db.execute(ddl)
+            await db.commit()
+            await reset_zombie_sessions(db)
+        logger.info("База данных инициализирована: Postgres (схема bot)")
+        return
+
+    async with connect_db() as db:
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -255,37 +456,40 @@ async def init_db() -> None:
                 except aiosqlite.OperationalError as exc:
                     logger.warning("Не удалось добавить колонку %s: %s", column_name, exc)
         await db.commit()
-
-        # UPDATE: очистка "зомби-сессий" при рестарте бота.
-        # Фоновые задачи search_timeout_task и партнёрские связи 'chatting' /
-        # 'ai_chat' живут только в памяти процесса — после перезапуска они
-        # теряются, но статус в БД остаётся прежним, и пользователь застревает
-        # в несуществующем чате/поиске навсегда. Поэтому при каждом старте
-        # принудительно сбрасываем все "активные" статусы обратно в 'idle'.
-        cursor = await db.execute(
-            "SELECT COUNT(*) FROM users WHERE status IN ('searching', 'chatting', 'ai_chat')"
-        )
-        zombie_count = (await cursor.fetchone())[0]
-        if zombie_count:
-            await db.execute(
-                """
-                UPDATE users
-                SET status = 'idle', partner_id = NULL, current_session_id = NULL
-                WHERE status IN ('searching', 'chatting', 'ai_chat')
-                """
-            )
-            await db.execute(
-                "UPDATE chat_sessions SET ended_at = ? WHERE ended_at IS NULL",
-                (datetime.utcnow().isoformat(),),
-            )
-            await db.commit()
-            logger.info("Сброшено зомби-сессий при старте: %s", zombie_count)
+        await reset_zombie_sessions(db)
 
     logger.info("База данных инициализирована: %s", DB_PATH)
 
 
+async def reset_zombie_sessions(db) -> None:
+    # UPDATE: очистка "зомби-сессий" при рестарте бота.
+    # Фоновые задачи search_timeout_task и партнёрские связи 'chatting' /
+    # 'ai_chat' живут только в памяти процесса — после перезапуска они
+    # теряются, но статус в БД остаётся прежним, и пользователь застревает
+    # в несуществующем чате/поиске навсегда. Поэтому при каждом старте
+    # принудительно сбрасываем все "активные" статусы обратно в 'idle'.
+    cursor = await db.execute(
+        "SELECT COUNT(*) FROM users WHERE status IN ('searching', 'chatting', 'ai_chat')"
+    )
+    zombie_count = (await cursor.fetchone())[0]
+    if zombie_count:
+        await db.execute(
+            """
+            UPDATE users
+            SET status = 'idle', partner_id = NULL, current_session_id = NULL
+            WHERE status IN ('searching', 'chatting', 'ai_chat')
+            """
+        )
+        await db.execute(
+            "UPDATE chat_sessions SET ended_at = ? WHERE ended_at IS NULL",
+            (datetime.utcnow().isoformat(),),
+        )
+        await db.commit()
+        logger.info("Сброшено зомби-сессий при старте: %s", zombie_count)
+
+
 async def ensure_user(user_id: int, username: str | None = None) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         cursor = await db.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
         row = await cursor.fetchone()
         if row is None:
@@ -305,7 +509,7 @@ async def ensure_user(user_id: int, username: str | None = None) -> None:
 
 
 async def get_user(user_id: int) -> aiosqlite.Row | None:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
         return await cursor.fetchone()
@@ -316,7 +520,7 @@ async def update_user(user_id: int, **fields) -> None:
         return
     set_clause = ", ".join(f"{key} = ?" for key in fields)
     values = list(fields.values()) + [user_id]
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         await db.execute(f"UPDATE users SET {set_clause} WHERE user_id = ?", values)
         await db.commit()
 
@@ -326,7 +530,7 @@ async def update_user(user_id: int, **fields) -> None:
 # read-then-write с округлением через Python дал бы гонку между двумя
 # участниками, завершающими сессию почти одновременно.
 async def increment_completed_chats(user_id: int) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         await db.execute(
             "UPDATE users SET completed_chats = completed_chats + 1 WHERE user_id = ?",
             (user_id,),
@@ -335,19 +539,20 @@ async def increment_completed_chats(user_id: int) -> None:
 
 
 async def create_session(user_a: int, user_b: int) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         cursor = await db.execute(
-            "INSERT INTO chat_sessions (user_a, user_b, started_at) VALUES (?, ?, ?)",
+            "INSERT INTO chat_sessions (user_a, user_b, started_at) VALUES (?, ?, ?) RETURNING id",
             (user_a, user_b, datetime.utcnow().isoformat()),
         )
+        row = await cursor.fetchone()
         await db.commit()
-        return cursor.lastrowid
+        return row[0]
 
 
 async def close_session(session_id: int | None) -> None:
     if not session_id:
         return
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         await db.execute(
             "UPDATE chat_sessions SET ended_at = ? WHERE id = ? AND ended_at IS NULL",
             (datetime.utcnow().isoformat(), session_id),
@@ -358,7 +563,7 @@ async def close_session(session_id: int | None) -> None:
 async def get_session_counterpart(session_id: int, user_id: int) -> int | None:
     """SECURITY (BOT-01): возвращает собеседника, только если user_id был
     участником этой сессии и сессия уже завершена. Иначе None."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         cursor = await db.execute(
             "SELECT user_a, user_b, ended_at FROM chat_sessions WHERE id = ?", (session_id,)
         )
@@ -376,14 +581,14 @@ async def get_session_counterpart(session_id: int, user_id: int) -> int | None:
 async def add_rating(session_id: int, rater_id: int, target_id: int, score: int) -> bool:
     """Одна оценка на участника сессии. Рейтинг пересчитывается из таблицы
     ratings целиком, без read-then-write гонки. False — уже оценивал."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         try:
             await db.execute(
                 "INSERT INTO ratings (session_id, rater_id, target_id, score, created_at) "
                 "VALUES (?, ?, ?, ?, ?)",
                 (session_id, rater_id, target_id, score, datetime.utcnow().isoformat()),
             )
-        except aiosqlite.IntegrityError:
+        except DB_INTEGRITY_ERRORS:
             return False
         await db.execute(
             """
@@ -401,14 +606,14 @@ async def add_rating(session_id: int, rater_id: int, target_id: int, score: int)
 async def add_report(session_id: int, reporter_id: int, reported_id: int) -> int | None:
     """Одна жалоба на участника сессии. Возвращает число РАЗНЫХ жалобщиков
     на этого пользователя или None, если жалоба по этой сессии уже была."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         try:
             await db.execute(
                 "INSERT INTO reports (session_id, reporter_id, reported_id, created_at) "
                 "VALUES (?, ?, ?, ?)",
                 (session_id, reporter_id, reported_id, datetime.utcnow().isoformat()),
             )
-        except aiosqlite.IntegrityError:
+        except DB_INTEGRITY_ERRORS:
             return None
         cursor = await db.execute(
             "SELECT COUNT(DISTINCT reporter_id) FROM reports WHERE reported_id = ?",
@@ -430,7 +635,7 @@ async def is_user_banned(user_id: int) -> bool:
 
 # UPDATE: сохранение отзыва в таблицу feedback.
 async def save_feedback(user_id: int, category: str, rating: int, comment: str | None) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         await db.execute(
             "INSERT INTO feedback (user_id, category, rating, comment) VALUES (?, ?, ?, ?)",
             (user_id, category, rating, comment),
@@ -448,7 +653,7 @@ async def save_feedback(user_id: int, category: str, rating: int, comment: str |
 #      расхождения в настройках. Точный матч всегда имеет приоритет —
 #      фолбэк применяется только если он не нашёлся.
 async def find_partner(user_id: int, topic: str, my_level: str, partner_level: str) -> int | None:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         cursor = await db.execute(
             """
             SELECT user_id FROM users
@@ -875,7 +1080,7 @@ async def delete_user_data(user_id: int) -> None:
         await end_chat(user_id)
         user = await get_user(user_id)
     banned = bool(user and user["is_banned"])
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         await db.execute("DELETE FROM feedback WHERE user_id = ?", (user_id,))
         await db.execute("DELETE FROM ratings WHERE rater_id = ? OR target_id = ?", (user_id, user_id))
         await db.execute("UPDATE reports SET reporter_id = NULL WHERE reporter_id = ?", (user_id,))
@@ -910,7 +1115,7 @@ async def cmd_reports(message: Message) -> None:
     if message.from_user.id != ADMIN_ID:
         return
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "SELECT * FROM reports ORDER BY id DESC LIMIT 10"
@@ -936,7 +1141,7 @@ async def cmd_feedback_stats(message: Message) -> None:
     if message.from_user.id != ADMIN_ID:
         return
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         cursor = await db.execute("SELECT COUNT(*), AVG(rating) FROM feedback")
         total_count, avg_rating = await cursor.fetchone()
 
@@ -986,7 +1191,7 @@ async def cmd_feedback_stats(message: Message) -> None:
     # комментарием. Джойним users, чтобы показать username (если есть),
     # без него падать не должны — у части пользователей username может
     # отсутствовать.
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
@@ -1076,7 +1281,7 @@ async def cmd_download_feedback(message: Message) -> None:
     if message.from_user.id != ADMIN_ID:
         return
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
@@ -1731,7 +1936,7 @@ async def show_profile(message: Message, user: aiosqlite.Row) -> None:
 # UPDATE: show_stats переписан на реальную агрегацию по БД одним запросом
 # вместо трёх отдельных SELECT'ов, плюс добавлены total_chats и global_rating.
 async def show_stats(message: Message, user: aiosqlite.Row) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         cursor = await db.execute(
             """
             SELECT
@@ -1777,6 +1982,9 @@ async def show_stats(message: Message, user: aiosqlite.Row) -> None:
 # =============================================================================
 
 async def health_check(request: web.Request) -> web.Response:
+    # Пинг БД держит бесплатный Supabase активным; ответ всегда 200, чтобы
+    # кратковременная недоступность БД не перезапускала бота.
+    await db_ping()
     return web.Response(text="OK", status=200)
 
 
