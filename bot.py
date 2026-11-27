@@ -1100,7 +1100,7 @@ async def get_ai_reply(user_id: int, my_level: str, user_text: str) -> str:
 async def cmd_start(message: Message) -> None:
     await ensure_user(message.from_user.id, message.from_user.username)
     await message.answer(
-        "👋 Добро пожаловать в Language Exchange Bot!\n\n"
+        "👋 Добро пожаловать в LangScope!\n\n"
         "Здесь вы можете найти собеседника для языковой практики или "
         "потренироваться с AI-Репетитором.\n\n"
         "Настройте параметры поиска через «⚙️ Настройка собеседника» "
@@ -1771,7 +1771,7 @@ async def cb_feedback_skip(callback: CallbackQuery, state: FSMContext) -> None:
 
     try:
         await callback.message.edit_text(
-            "✅ Спасибо за feedback! Ваш отзыв сохранён и поможет улучшить Language Exchange Bot.",
+            "✅ Спасибо за feedback! Ваш отзыв сохранён и поможет улучшить LangScope.",
             reply_markup=None,
         )
     except TelegramBadRequest:
@@ -1897,7 +1897,7 @@ async def unified_text_handler(message: Message, state: FSMContext) -> None:
         )
         await state.clear()
         await message.answer(
-            "✅ Спасибо за feedback! Ваш отзыв сохранён и поможет улучшить Language Exchange Bot.",
+            "✅ Спасибо за feedback! Ваш отзыв сохранён и поможет улучшить LangScope.",
             reply_markup=main_menu_keyboard(),
         )
         return
