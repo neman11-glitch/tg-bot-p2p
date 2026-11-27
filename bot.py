@@ -7,7 +7,7 @@ import html
 import io
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import aiosqlite
 from aiohttp import web
@@ -2095,6 +2095,44 @@ async def start_health_check() -> None:
     logger.info("Health-check сервер запущен на 0.0.0.0:%s", port)
 
 
+# --- Ежедневная сводка по сайту (M1) -----------------------------------------
+# Заменяет открытый endpoint /api/telegram на сайте. Бот получает из базы
+# только готовый текст с итоговыми цифрами (функция bot.site_summary()).
+
+SUMMARY_HOUR_UTC = 15          # 20:00 по Алматы
+SUMMARY_CHECK_SECONDS = 600
+
+
+async def send_daily_summary_if_due(now: datetime) -> bool:
+    """Отправляет сводку не больше одного раза в сутки. День помечается в той
+    же транзакции: если отправка не удалась, отметка откатывается и попытка
+    повторится позже."""
+    if not using_postgres() or now.hour < SUMMARY_HOUR_UTC:
+        return False
+    async with connect_db() as db:
+        cursor = await db.execute(
+            "INSERT INTO summary_log (day) VALUES (?) ON CONFLICT (day) DO NOTHING RETURNING day",
+            (now.date(),),
+        )
+        if await cursor.fetchone() is None:
+            return False
+        cursor = await db.execute("SELECT bot.site_summary()")
+        row = await cursor.fetchone()
+        await bot.send_message(ADMIN_ID, row[0], parse_mode=None)
+        await db.commit()
+    return True
+
+
+async def daily_summary_loop() -> None:
+    while True:
+        try:
+            if await send_daily_summary_if_due(datetime.now(timezone.utc)):
+                logger.info("Сводка по сайту отправлена администратору.")
+        except Exception as error:
+            logger.warning("Сводка по сайту не отправлена: %s", type(error).__name__)
+        await asyncio.sleep(SUMMARY_CHECK_SECONDS)
+
+
 async def main() -> None:
     await init_db()
     logger.info("P2P-поиск: %s", "ВКЛЮЧЁН" if P2P_ENABLED else "отключён (P2P_ENABLED != 1)")
@@ -2106,7 +2144,11 @@ async def main() -> None:
         logger.info("Не удалось отправить стартовое сообщение администратору (это нормально при первом запуске).")
 
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    summary_task = asyncio.create_task(daily_summary_loop())
+    try:
+        await dp.start_polling(bot)
+    finally:
+        summary_task.cancel()
 
 
 if __name__ == "__main__":
