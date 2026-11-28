@@ -7,7 +7,8 @@ import html
 import io
 import logging
 import time
-from datetime import datetime, timezone
+from collections import OrderedDict, deque
+from datetime import datetime, timedelta, timezone
 
 import aiosqlite
 from aiohttp import web
@@ -98,6 +99,52 @@ bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTM
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
+
+
+# --- Защита от повторов и флуда (L1) -----------------------------------------
+# 1) Telegram может доставить одно и то же обновление повторно (например, после
+#    сбоя сети) — обрабатываем каждый update_id один раз.
+# 2) Общий лимит сообщений и нажатий на пользователя: лишние молча
+#    отбрасываются, чтобы флуд не нагружал базу. Лимиты AI действуют отдельно.
+SEEN_UPDATES_MAX = 2000
+USER_RATE_WINDOW = 60                                   # секунд
+USER_RATE_LIMIT = int(os.getenv("USER_RATE_LIMIT_PER_MIN", "30"))
+_seen_updates: "OrderedDict[int, None]" = OrderedDict()
+_user_events: dict[int, deque] = {}
+
+
+def update_is_duplicate(update_id: int) -> bool:
+    if update_id in _seen_updates:
+        return True
+    _seen_updates[update_id] = None
+    while len(_seen_updates) > SEEN_UPDATES_MAX:
+        _seen_updates.popitem(last=False)
+    return False
+
+
+def user_over_limit(user_id: int, now: float) -> bool:
+    if user_id == ADMIN_ID:
+        return False
+    events = _user_events.setdefault(user_id, deque())
+    while events and now - events[0] >= USER_RATE_WINDOW:
+        events.popleft()
+    if len(events) >= USER_RATE_LIMIT:
+        return True
+    events.append(now)
+    if len(_user_events) > 10000:
+        for uid in [u for u, ev in _user_events.items() if not ev or now - ev[-1] >= USER_RATE_WINDOW]:
+            _user_events.pop(uid, None)
+    return False
+
+
+@dp.update.outer_middleware()
+async def guard_updates(handler, update, data):
+    if update_is_duplicate(update.update_id):
+        return None
+    sender = data.get("event_from_user")
+    if sender is not None and user_over_limit(sender.id, time.monotonic()):
+        return None
+    return await handler(update, data)
 
 LEVELS = [
     ("A1-A2", "A1-A2 (Beginner - Pre-Intermediate)"),
@@ -494,7 +541,7 @@ async def reset_zombie_sessions(db) -> None:
 
 async def ensure_user(user_id: int, username: str | None = None) -> None:
     async with connect_db() as db:
-        cursor = await db.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+        cursor = await db.execute("SELECT user_id, username FROM users WHERE user_id = ?", (user_id,))
         row = await cursor.fetchone()
         if row is None:
             await db.execute(
@@ -505,7 +552,8 @@ async def ensure_user(user_id: int, username: str | None = None) -> None:
                 (user_id, username or "", datetime.utcnow().isoformat()),
             )
             await db.commit()
-        elif username:
+        elif username and row[1] != username:
+            # L1: пишем в базу только при реальной смене username.
             await db.execute(
                 "UPDATE users SET username = ? WHERE user_id = ?", (username, user_id)
             )
@@ -638,13 +686,34 @@ async def is_user_banned(user_id: int) -> bool:
 
 
 # UPDATE: сохранение отзыва в таблицу feedback.
-async def save_feedback(user_id: int, category: str, rating: int, comment: str | None) -> None:
+FEEDBACK_DUPLICATE_WINDOW = timedelta(minutes=10)
+
+
+async def save_feedback(user_id: int, category: str, rating: int, comment: str | None) -> bool:
+    """Сохраняет отзыв. Такой же отзыв (пользователь, категория, оценка, текст)
+    за последние 10 минут не дублируется (L1: повторная доставка, двойное
+    нажатие). Возвращает True, если строка добавлена."""
     async with connect_db() as db:
+        cursor = await db.execute(
+            "SELECT created_at, comment FROM feedback WHERE user_id = ? AND category = ? AND rating = ? "
+            "ORDER BY id DESC LIMIT 5",
+            (user_id, category, rating),
+        )
+        for created_at, old_comment in await cursor.fetchall():
+            if (old_comment or None) != (comment or None) or created_at is None:
+                continue
+            if isinstance(created_at, str):
+                created_at = datetime.fromisoformat(created_at.replace(" ", "T"))
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) - created_at < FEEDBACK_DUPLICATE_WINDOW:
+                return False
         await db.execute(
             "INSERT INTO feedback (user_id, category, rating, comment) VALUES (?, ?, ?, ?)",
             (user_id, category, rating, comment),
         )
         await db.commit()
+    return True
 
 
 # UPDATE: find_partner теперь двухступенчатый.
